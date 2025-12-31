@@ -23,6 +23,162 @@ const defaultData: CashFlowData = {
   categoryColors: {}
 };
 
+// Sample data for preview mode - demonstrates app features
+const getPreviewData = (): CashFlowData => {
+  const today = new Date();
+  const currentYear = today.getFullYear();
+  const currentMonth = today.getMonth();
+  const firstOfMonth = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-01`;
+  const lastMonth = currentMonth === 0 
+    ? `${currentYear - 1}-12-01` 
+    : `${currentYear}-${String(currentMonth).padStart(2, '0')}-01`;
+  
+  // Find next Friday for paycheck
+  const nextFriday = new Date(today);
+  nextFriday.setDate(today.getDate() + ((5 - today.getDay() + 7) % 7 || 7));
+  const paycheckDate = `${nextFriday.getFullYear()}-${String(nextFriday.getMonth() + 1).padStart(2, '0')}-${String(nextFriday.getDate()).padStart(2, '0')}`;
+
+  return {
+    startingBalance: 3247.82,
+    startingDate: firstOfMonth,
+    warningThreshold: 500,
+    floorThreshold: 100,
+    incomes: [
+      {
+        id: 'preview-income-1',
+        name: 'Paycheck',
+        amount: 2847.50,
+        frequency: 'biweekly',
+        startDate: paycheckDate
+      },
+      {
+        id: 'preview-income-2',
+        name: 'Freelance Work',
+        amount: 450,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-15`
+      }
+    ],
+    expenses: [
+      // Housing
+      {
+        id: 'preview-expense-1',
+        name: 'Rent',
+        amount: 1650,
+        frequency: 'monthly',
+        startDate: firstOfMonth,
+        category: 'housing'
+      },
+      // Utilities
+      {
+        id: 'preview-expense-2',
+        name: 'Electric',
+        amount: 145,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-18`,
+        category: 'utilities'
+      },
+      {
+        id: 'preview-expense-3',
+        name: 'Internet',
+        amount: 79.99,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-05`,
+        category: 'utilities'
+      },
+      // Auto
+      {
+        id: 'preview-expense-4',
+        name: 'Car Payment',
+        amount: 387.42,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-10`,
+        category: 'auto'
+      },
+      {
+        id: 'preview-expense-5',
+        name: 'Car Insurance',
+        amount: 142,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-01`,
+        category: 'insurance'
+      },
+      // Food - split payment example
+      {
+        id: 'preview-expense-6',
+        name: 'Groceries',
+        amount: 600,
+        frequency: 'split',
+        startDate: firstOfMonth,
+        category: 'food',
+        splitConfig: {
+          firstDay: 1,
+          firstAmount: 350,
+          secondDay: 15,
+          secondAmount: 250
+        }
+      },
+      // Subscriptions
+      {
+        id: 'preview-expense-7',
+        name: 'Streaming Services',
+        amount: 45.97,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-12`,
+        category: 'subscriptions'
+      },
+      {
+        id: 'preview-expense-8',
+        name: 'Gym Membership',
+        amount: 49.99,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-01`,
+        category: 'health'
+      },
+      // Credit Card
+      {
+        id: 'preview-expense-9',
+        name: 'Visa Card',
+        amount: 350,
+        frequency: 'monthly',
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-20`,
+        category: 'credit_card',
+        creditCard: {
+          totalDebt: 4850,
+          currentBalance: 4850,
+          balanceAsOfDate: firstOfMonth,
+          apr: 22.99,
+          minimumPayment: 97
+        }
+      },
+      // Payment Plan example
+      {
+        id: 'preview-expense-10',
+        name: 'Medical Bill',
+        amount: 125,
+        frequency: 'payment_plan',
+        startDate: lastMonth,
+        category: 'health',
+        paymentPlan: {
+          totalDebt: 750,
+          paymentCount: 6,
+          frequency: 'monthly'
+        }
+      },
+      // One-time expense
+      {
+        id: 'preview-expense-11',
+        name: 'Car Registration',
+        amount: 285,
+        frequency: 'once',
+        date: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-22`,
+        category: 'auto'
+      }
+    ],
+    categoryColors: {}
+  };
+};
+
 const expenseCategories = [
   { value: 'housing', label: 'Housing' }, { value: 'utilities', label: 'Utilities' }, { value: 'auto', label: 'Auto/Transport' },
   { value: 'insurance', label: 'Insurance' }, { value: 'food', label: 'Food/Groceries' }, { value: 'health', label: 'Health/Medical' },
@@ -584,7 +740,7 @@ interface CashFlowAppProps {
 export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const isPreviewMode = !user;
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [data, setData] = useState<CashFlowData>(defaultData);
+  const [data, setData] = useState<CashFlowData>(() => isPreviewMode ? getPreviewData() : defaultData);
   const [loading, setLoading] = useState(!isPreviewMode); // Don't show loading in preview mode
   const [saving, setSaving] = useState(false);
   const [selectedMonth, setSelectedMonth] = useState(() => { const now = new Date(); return { year: now.getFullYear(), month: now.getMonth() }; });
