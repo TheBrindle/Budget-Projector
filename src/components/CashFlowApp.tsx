@@ -767,17 +767,25 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     if (isPreviewMode) return;
     
     const loadData = async () => {
+      console.log('📥 Loading data from Supabase...');
       try {
         const { data: cashflowData, error } = await supabase.from('cashflow_data').select('*').eq('user_id', user!.id).single();
         if (error) {
-          console.error('Error loading data:', error);
+          console.error('❌ Error loading data:', error);
           setLoading(false);
           return;
         }
         if (cashflowData) {
+          // Debug: Log raw data from Supabase
+          console.log('📦 Raw data from Supabase:', cashflowData);
+          
           // Ensure incomes and expenses arrays have their overrides properly parsed
           const incomes = Array.isArray(cashflowData.incomes) ? cashflowData.incomes : [];
           const expenses = Array.isArray(cashflowData.expenses) ? cashflowData.expenses : [];
+          
+          // Debug: Log overrides found
+          console.log('Incomes with overrides:', incomes.filter((i: Income) => i.overrides?.length).map((i: Income) => ({ name: i.name, overrides: i.overrides })));
+          console.log('Expenses with overrides:', expenses.filter((e: Expense) => e.overrides?.length).map((e: Expense) => ({ name: e.name, overrides: e.overrides })));
           
           setData({
             id: cashflowData.id, 
@@ -790,9 +798,10 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
             expenses: expenses,
             categoryColors: cashflowData.category_colors || {}
           });
+          console.log('✅ Data loaded successfully');
         }
       } catch (err) {
-        console.error('Exception loading data:', err);
+        console.error('❌ Exception loading data:', err);
       }
       setLoading(false);
     };
@@ -804,23 +813,57 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     if (isPreviewMode) return;
     
     setSaving(true);
+    
+    // Debug: Log what we're saving
+    console.log('💾 Saving data to Supabase...');
+    console.log('Incomes with overrides:', newData.incomes.filter(i => i.overrides?.length).map(i => ({ name: i.name, overrides: i.overrides })));
+    console.log('Expenses with overrides:', newData.expenses.filter(e => e.overrides?.length).map(e => ({ name: e.name, overrides: e.overrides })));
+    
+    const payload = {
+      user_id: user!.id, 
+      starting_balance: newData.startingBalance, 
+      starting_date: newData.startingDate,
+      warning_threshold: newData.warningThreshold, 
+      floor_threshold: newData.floorThreshold, 
+      incomes: newData.incomes, 
+      expenses: newData.expenses,
+      category_colors: newData.categoryColors || {}
+    };
+    
     try {
-      const { error } = await supabase.from('cashflow_data').upsert({
-        user_id: user!.id, 
-        starting_balance: newData.startingBalance, 
-        starting_date: newData.startingDate,
-        warning_threshold: newData.warningThreshold, 
-        floor_threshold: newData.floorThreshold, 
-        incomes: newData.incomes, 
-        expenses: newData.expenses,
-        category_colors: newData.categoryColors || {}
-      }, { onConflict: 'user_id' });
+      // First try to update existing row
+      const { data: existingData, error: selectError } = await supabase
+        .from('cashflow_data')
+        .select('id')
+        .eq('user_id', user!.id)
+        .single();
       
-      if (error) {
-        console.error('Error saving data:', error);
+      if (existingData) {
+        // Row exists, update it
+        const { error } = await supabase
+          .from('cashflow_data')
+          .update(payload)
+          .eq('user_id', user!.id);
+        
+        if (error) {
+          console.error('❌ Error updating data:', error);
+        } else {
+          console.log('✅ Data updated successfully');
+        }
+      } else {
+        // Row doesn't exist, insert it
+        const { error } = await supabase
+          .from('cashflow_data')
+          .insert(payload);
+        
+        if (error) {
+          console.error('❌ Error inserting data:', error);
+        } else {
+          console.log('✅ Data inserted successfully');
+        }
       }
     } catch (err) {
-      console.error('Exception saving data:', err);
+      console.error('❌ Exception saving data:', err);
     }
     setSaving(false);
   };
@@ -855,16 +898,25 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const handleSaveInstanceOverride = (override: InstanceOverride) => {
     if (!editingEvent || !editingItem) return;
     
+    console.log('🔧 Saving instance override:', override);
+    
     // Get fresh reference to the item from current data
     const currentItem = editingEvent.type === 'income'
       ? data.incomes.find(i => i.id === editingItem.id)
       : data.expenses.find(e => e.id === editingItem.id);
     
-    if (!currentItem) return;
+    if (!currentItem) {
+      console.error('❌ Could not find item to update:', editingItem.id);
+      return;
+    }
+    
+    console.log('📝 Current item:', currentItem.name, 'existing overrides:', currentItem.overrides);
     
     const existingOverrides = currentItem.overrides || [];
     const newOverrides = existingOverrides.filter(o => o.originalDate !== override.originalDate);
     newOverrides.push(override);
+    
+    console.log('📝 New overrides array:', newOverrides);
     
     if (editingEvent.type === 'income') {
       updateIncome(editingItem.id, { overrides: newOverrides });
