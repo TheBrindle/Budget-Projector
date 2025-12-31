@@ -767,17 +767,32 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     if (isPreviewMode) return;
     
     const loadData = async () => {
-      const { data: cashflowData, error } = await supabase.from('cashflow_data').select('*').eq('user_id', user!.id).single();
-      if (!error && cashflowData) {
-        setData({
-          id: cashflowData.id, user_id: cashflowData.user_id,
-          startingBalance: parseFloat(cashflowData.starting_balance) || 0,
-          startingDate: cashflowData.starting_date || new Date().toISOString().split('T')[0],
-          warningThreshold: parseFloat(cashflowData.warning_threshold) || 500,
-          floorThreshold: parseFloat(cashflowData.floor_threshold) || 50,
-          incomes: cashflowData.incomes || [], expenses: cashflowData.expenses || [],
-          categoryColors: cashflowData.category_colors || {}
-        });
+      try {
+        const { data: cashflowData, error } = await supabase.from('cashflow_data').select('*').eq('user_id', user!.id).single();
+        if (error) {
+          console.error('Error loading data:', error);
+          setLoading(false);
+          return;
+        }
+        if (cashflowData) {
+          // Ensure incomes and expenses arrays have their overrides properly parsed
+          const incomes = Array.isArray(cashflowData.incomes) ? cashflowData.incomes : [];
+          const expenses = Array.isArray(cashflowData.expenses) ? cashflowData.expenses : [];
+          
+          setData({
+            id: cashflowData.id, 
+            user_id: cashflowData.user_id,
+            startingBalance: parseFloat(cashflowData.starting_balance) || 0,
+            startingDate: cashflowData.starting_date || new Date().toISOString().split('T')[0],
+            warningThreshold: parseFloat(cashflowData.warning_threshold) || 500,
+            floorThreshold: parseFloat(cashflowData.floor_threshold) || 50,
+            incomes: incomes,
+            expenses: expenses,
+            categoryColors: cashflowData.category_colors || {}
+          });
+        }
+      } catch (err) {
+        console.error('Exception loading data:', err);
       }
       setLoading(false);
     };
@@ -789,12 +804,24 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     if (isPreviewMode) return;
     
     setSaving(true);
-    await supabase.from('cashflow_data').upsert({
-      user_id: user!.id, starting_balance: newData.startingBalance, starting_date: newData.startingDate,
-      warning_threshold: newData.warningThreshold, floor_threshold: newData.floorThreshold, 
-      incomes: newData.incomes, expenses: newData.expenses,
-      category_colors: newData.categoryColors || {}
-    }, { onConflict: 'user_id' });
+    try {
+      const { error } = await supabase.from('cashflow_data').upsert({
+        user_id: user!.id, 
+        starting_balance: newData.startingBalance, 
+        starting_date: newData.startingDate,
+        warning_threshold: newData.warningThreshold, 
+        floor_threshold: newData.floorThreshold, 
+        incomes: newData.incomes, 
+        expenses: newData.expenses,
+        category_colors: newData.categoryColors || {}
+      }, { onConflict: 'user_id' });
+      
+      if (error) {
+        console.error('Error saving data:', error);
+      }
+    } catch (err) {
+      console.error('Exception saving data:', err);
+    }
     setSaving(false);
   };
 
@@ -828,7 +855,14 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const handleSaveInstanceOverride = (override: InstanceOverride) => {
     if (!editingEvent || !editingItem) return;
     
-    const existingOverrides = editingItem.overrides || [];
+    // Get fresh reference to the item from current data
+    const currentItem = editingEvent.type === 'income'
+      ? data.incomes.find(i => i.id === editingItem.id)
+      : data.expenses.find(e => e.id === editingItem.id);
+    
+    if (!currentItem) return;
+    
+    const existingOverrides = currentItem.overrides || [];
     const newOverrides = existingOverrides.filter(o => o.originalDate !== override.originalDate);
     newOverrides.push(override);
     
@@ -837,24 +871,28 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     } else {
       updateExpense(editingItem.id, { overrides: newOverrides });
     }
-    setModal(null);
     setEditingEvent(null);
-    setEditingItem(null);
   };
 
   const handleRemoveInstanceOverride = () => {
     if (!editingEvent || !editingItem) return;
+    
+    // Get fresh reference to the item from current data
+    const currentItem = editingEvent.type === 'income'
+      ? data.incomes.find(i => i.id === editingItem.id)
+      : data.expenses.find(e => e.id === editingItem.id);
+    
+    if (!currentItem) return;
+    
     const originalDate = editingEvent.originalDate || editingEvent.instanceDate;
-    const newOverrides = (editingItem.overrides || []).filter(o => o.originalDate !== originalDate);
+    const newOverrides = (currentItem.overrides || []).filter(o => o.originalDate !== originalDate);
     
     if (editingEvent.type === 'income') {
       updateIncome(editingItem.id, { overrides: newOverrides });
     } else {
       updateExpense(editingItem.id, { overrides: newOverrides });
     }
-    setModal(null);
     setEditingEvent(null);
-    setEditingItem(null);
   };
 
   const handleEditRecurring = () => {
@@ -1141,7 +1179,17 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     if (isPreviewMode && onExitPreview) {
       onExitPreview();
     } else {
-      await supabase.auth.signOut(); 
+      try {
+        const { error } = await supabase.auth.signOut();
+        if (error) {
+          console.error('Sign out error:', error);
+        }
+        // Force reload to clear any cached state
+        window.location.href = '/';
+      } catch (err) {
+        console.error('Sign out exception:', err);
+        window.location.href = '/';
+      }
     }
   };
 
