@@ -105,6 +105,8 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
             <option value="biweekly">Every 2 weeks</option>
             <option value="semimonthly">Twice a month (same amount)</option>
             <option value="monthly">Monthly</option>
+            <option value="bimonthly">Every 2 months</option>
+            <option value="quarterly">Quarterly (every 3 months)</option>
             <option value="split">Split Monthly (different amounts)</option>
           </select>
         </div>
