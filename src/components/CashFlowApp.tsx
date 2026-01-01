@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
-import { encrypt, decrypt, isEncryptionEnabled } from '@/lib/crypto';
 import { User } from '@supabase/supabase-js';
 import { CashFlowData, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey } from '@/lib/types';
 import Modal from './Modal';
@@ -794,65 +793,26 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
           return;
         }
         if (cashflowData) {
-          // Check if we have encrypted data
-          if (cashflowData.encrypted_data && isEncryptionEnabled()) {
-            // Decrypt the data
-            try {
-              const decrypted = await decrypt<{
-                startingBalance: number;
-                startingDate: string;
-                warningThreshold: number;
-                floorThreshold: number;
-                incomes: Income[];
-                expenses: Expense[];
-                categoryColors: Record<string, string>;
-              }>(cashflowData.encrypted_data);
-              
-              setData({
-                id: cashflowData.id,
-                user_id: cashflowData.user_id,
-                startingBalance: decrypted.startingBalance || 0,
-                startingDate: decrypted.startingDate || new Date().toISOString().split('T')[0],
-                warningThreshold: decrypted.warningThreshold || 500,
-                floorThreshold: decrypted.floorThreshold || 50,
-                incomes: decrypted.incomes || [],
-                expenses: decrypted.expenses || [],
-                categoryColors: decrypted.categoryColors || {}
-              });
-            } catch (decryptError) {
-              console.error('Error decrypting data:', decryptError);
-              // Fall back to unencrypted data if decryption fails
-              loadUnencryptedData(cashflowData);
-            }
-          } else {
-            // Load unencrypted data (legacy or encryption not enabled)
-            loadUnencryptedData(cashflowData);
-          }
+          const incomes = Array.isArray(cashflowData.incomes) ? cashflowData.incomes : [];
+          const expenses = Array.isArray(cashflowData.expenses) ? cashflowData.expenses : [];
+          
+          setData({
+            id: cashflowData.id, 
+            user_id: cashflowData.user_id,
+            startingBalance: parseFloat(cashflowData.starting_balance) || 0,
+            startingDate: cashflowData.starting_date || new Date().toISOString().split('T')[0],
+            warningThreshold: parseFloat(cashflowData.warning_threshold) || 500,
+            floorThreshold: parseFloat(cashflowData.floor_threshold) || 50,
+            incomes: incomes,
+            expenses: expenses,
+            categoryColors: cashflowData.category_colors || {}
+          });
         }
       } catch (err) {
         console.error('Error loading data:', err);
       }
       setLoading(false);
     };
-    
-    // Helper to load unencrypted data format
-    const loadUnencryptedData = (cashflowData: any) => {
-      const incomes = Array.isArray(cashflowData.incomes) ? cashflowData.incomes : [];
-      const expenses = Array.isArray(cashflowData.expenses) ? cashflowData.expenses : [];
-      
-      setData({
-        id: cashflowData.id, 
-        user_id: cashflowData.user_id,
-        startingBalance: parseFloat(cashflowData.starting_balance) || 0,
-        startingDate: cashflowData.starting_date || new Date().toISOString().split('T')[0],
-        warningThreshold: parseFloat(cashflowData.warning_threshold) || 500,
-        floorThreshold: parseFloat(cashflowData.floor_threshold) || 50,
-        incomes: incomes,
-        expenses: expenses,
-        categoryColors: cashflowData.category_colors || {}
-      });
-    };
-    
     loadData();
   }, [user?.id, isPreviewMode]);
 
@@ -867,45 +827,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         .eq('user_id', user!.id)
         .single();
       
-      let payload: any;
-      
-      if (isEncryptionEnabled()) {
-        // Encrypt all financial data
-        const sensitiveData = {
-          startingBalance: newData.startingBalance,
-          startingDate: newData.startingDate,
-          warningThreshold: newData.warningThreshold,
-          floorThreshold: newData.floorThreshold,
-          incomes: newData.incomes,
-          expenses: newData.expenses,
-          categoryColors: newData.categoryColors || {}
-        };
-        
-        const encrypted = await encrypt(sensitiveData);
-        
-        payload = {
-          encrypted_data: encrypted,
-          // Clear the unencrypted columns (migration cleanup)
-          starting_balance: null,
-          starting_date: null,
-          warning_threshold: null,
-          floor_threshold: null,
-          incomes: null,
-          expenses: null,
-          category_colors: null
-        };
-      } else {
-        // Save unencrypted (legacy mode)
-        payload = {
-          starting_balance: newData.startingBalance, 
-          starting_date: newData.startingDate,
-          warning_threshold: newData.warningThreshold, 
-          floor_threshold: newData.floorThreshold, 
-          incomes: newData.incomes, 
-          expenses: newData.expenses,
-          category_colors: newData.categoryColors || {}
-        };
-      }
+      const payload = {
+        starting_balance: newData.startingBalance, 
+        starting_date: newData.startingDate,
+        warning_threshold: newData.warningThreshold, 
+        floor_threshold: newData.floorThreshold, 
+        incomes: newData.incomes, 
+        expenses: newData.expenses,
+        category_colors: newData.categoryColors || {}
+      };
       
       if (existingData) {
         await supabase.from('cashflow_data').update(payload).eq('user_id', user!.id);
