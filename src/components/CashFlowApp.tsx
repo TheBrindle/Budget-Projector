@@ -173,6 +173,15 @@ const getPreviewData = (): CashFlowData => {
         frequency: 'once',
         date: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-22`,
         category: 'auto'
+      },
+      // Quarterly expense
+      {
+        id: 'preview-expense-12',
+        name: 'Water/Sewer',
+        amount: 185,
+        frequency: 'quarterly',
+        startDate: firstOfMonth,
+        category: 'utilities'
       }
     ],
     categoryColors: {}
@@ -194,7 +203,7 @@ const getCategoryColor = (category: string, categoryColors: Record<string, strin
 };
 
 const frequencyLabels: Record<string, string> = {
-  once: 'One-time', weekly: 'Weekly', biweekly: 'Every 2 weeks', semimonthly: 'Twice a month', monthly: 'Monthly', bimonthly: 'Every 2 months', payment_plan: 'Payment Plan', split: 'Split Monthly'
+  once: 'One-time', weekly: 'Weekly', biweekly: 'Every 2 weeks', semimonthly: 'Twice a month', monthly: 'Monthly', bimonthly: 'Every 2 months', quarterly: 'Quarterly', payment_plan: 'Payment Plan', split: 'Split Monthly'
 };
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
@@ -702,6 +711,17 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
       if (monthsFromStart >= 0 && monthsFromStart % 2 === 0) {
         if (maxPayments < Infinity) {
           const paymentNumber = monthsFromStart / 2;
+          if (paymentNumber < maxPayments) addOccurrence(new Date(year, month, dayOfMonth));
+        } else addOccurrence(new Date(year, month, dayOfMonth));
+      }
+      break;
+    }
+    case 'quarterly': {
+      const dayOfMonth = Math.min(start.getDate(), getDaysInMonth(year, month));
+      const monthsFromStart = (year - start.getFullYear()) * 12 + (month - start.getMonth());
+      if (monthsFromStart >= 0 && monthsFromStart % 3 === 0) {
+        if (maxPayments < Infinity) {
+          const paymentNumber = monthsFromStart / 3;
           if (paymentNumber < maxPayments) addOccurrence(new Date(year, month, dayOfMonth));
         } else addOccurrence(new Date(year, month, dayOfMonth));
       }
