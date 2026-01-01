@@ -52,7 +52,7 @@ export interface Expense {
   id: string;
   name: string;
   amount: number; // Total amount (for split: firstAmount + secondAmount)
-  frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'payment_plan' | 'split';
+  frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'bimonthly' | 'quarterly' | 'payment_plan' | 'split';
   startDate?: string;
   date?: string;
   category: string;
