@@ -3,10 +3,12 @@
 import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
-import { CashFlowData, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey } from '@/lib/types';
+import { CashFlowData, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
 import OneTimeIncomeForm from './forms/OneTimeIncomeForm';
+import GigIncomeForm from './forms/GigIncomeForm';
+import GigPaymentForm from './forms/GigPaymentForm';
 import ExpenseForm from './forms/ExpenseForm';
 import OneTimeExpenseForm from './forms/OneTimeExpenseForm';
 import CreditCardForm from './forms/CreditCardForm';
@@ -203,7 +205,7 @@ const getCategoryColor = (category: string, categoryColors: Record<string, strin
 };
 
 const frequencyLabels: Record<string, string> = {
-  once: 'One-time', weekly: 'Weekly', biweekly: 'Every 2 weeks', semimonthly: 'Twice a month', monthly: 'Monthly', bimonthly: 'Every 2 months', quarterly: 'Quarterly', payment_plan: 'Payment Plan', split: 'Split Monthly'
+  once: 'One-time', weekly: 'Weekly', biweekly: 'Every 2 weeks', semimonthly: 'Twice a month', monthly: 'Monthly', bimonthly: 'Every 2 months', quarterly: 'Quarterly', payment_plan: 'Payment Plan', split: 'Split Monthly', gig: 'Gig/Variable'
 };
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
@@ -505,6 +507,26 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
     return occurrences;
   }
 
+  // Handle gig frequency - return only scheduled payments in this month
+  if (item.frequency === 'gig') {
+    const income = item as Income;
+    const scheduledPayments = income.scheduledPayments || [];
+
+    scheduledPayments.forEach(payment => {
+      const paymentDate = parseDate(payment.date);
+      if (paymentDate.getFullYear() === year && paymentDate.getMonth() === month) {
+        occurrences.push({
+          day: paymentDate.getDate(),
+          dateStr: payment.date,
+          amount: payment.amount,
+          isOverride: false
+        });
+      }
+    });
+
+    return occurrences.sort((a, b) => a.day - b.day);
+  }
+
   const start = parseDate(item.startDate || item.date!);
   const expense = item as Expense;
   
@@ -773,6 +795,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const [monthDropdownOpen, setMonthDropdownOpen] = useState(false);
   const [pastMonthDropdownOpen, setPastMonthDropdownOpen] = useState(false);
   const [oldMonthWarning, setOldMonthWarning] = useState<{ show: boolean; event: DayEvent | null; item: Income | Expense | null }>({ show: false, event: null, item: null });
+  const [editingGigPayment, setEditingGigPayment] = useState<ScheduledPayment | null>(null);
 
   const supabase = createClient();
 
@@ -857,6 +880,70 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const updateExpense = (id: string, updates: Partial<Expense>) => { updateData({ expenses: data.expenses.map(e => e.id === id ? { ...e, ...updates } : e) }); setModal(null); setEditingItem(null); };
   const deleteExpense = (id: string) => { updateData({ expenses: data.expenses.filter(e => e.id !== id) }); };
 
+  // Gig income management functions
+  const addGigPayment = (incomeId: string, payment: Omit<ScheduledPayment, 'id'>) => {
+    const income = data.incomes.find(i => i.id === incomeId);
+    if (!income || income.frequency !== 'gig') return;
+
+    const newPayment: ScheduledPayment = {
+      ...payment,
+      id: Date.now().toString()
+    };
+
+    const updatedPayments = [...(income.scheduledPayments || []), newPayment];
+    updateData({
+      incomes: data.incomes.map(i =>
+        i.id === incomeId ? { ...i, scheduledPayments: updatedPayments } : i
+      )
+    });
+    setModal(null);
+    setEditingItem(null);
+    setEditingGigPayment(null);
+  };
+
+  const updateGigPayment = (incomeId: string, paymentId: string, updates: Partial<ScheduledPayment>) => {
+    const income = data.incomes.find(i => i.id === incomeId);
+    if (!income || income.frequency !== 'gig') return;
+
+    const updatedPayments = (income.scheduledPayments || []).map(p =>
+      p.id === paymentId ? { ...p, ...updates } : p
+    );
+
+    updateData({
+      incomes: data.incomes.map(i =>
+        i.id === incomeId ? { ...i, scheduledPayments: updatedPayments } : i
+      )
+    });
+    setModal(null);
+    setEditingItem(null);
+    setEditingGigPayment(null);
+  };
+
+  const deleteGigPayment = (incomeId: string, paymentId: string) => {
+    const income = data.incomes.find(i => i.id === incomeId);
+    if (!income || income.frequency !== 'gig') return;
+
+    const updatedPayments = (income.scheduledPayments || []).filter(p => p.id !== paymentId);
+
+    updateData({
+      incomes: data.incomes.map(i =>
+        i.id === incomeId ? { ...i, scheduledPayments: updatedPayments } : i
+      )
+    });
+  };
+
+  // Helper to get gig income sources
+  const gigIncomes = useMemo(() =>
+    data.incomes.filter(i => i.frequency === 'gig'),
+    [data.incomes]
+  );
+
+  // Helper to get regular (non-gig) income sources
+  const regularIncomes = useMemo(() =>
+    data.incomes.filter(i => i.frequency !== 'gig'),
+    [data.incomes]
+  );
+
   // Type-safe save handlers for modals
   const handleSaveIncome = (d: Omit<Income, 'id'>) => {
     if (editingItem) {
@@ -871,6 +958,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       updateExpense(editingItem.id, d);
     } else {
       addExpense(d);
+    }
+  };
+
+  // Handle gig payment save
+  const handleSaveGigPayment = (incomeId: string, payment: Omit<ScheduledPayment, 'id'>) => {
+    if (editingGigPayment) {
+      updateGigPayment(incomeId, editingGigPayment.id, payment);
+    } else {
+      addGigPayment(incomeId, payment);
     }
   };
 
@@ -1565,34 +1661,144 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
         {activeTab === 'income' && (
           <div className="space-y-3">
+            {/* Regular Income Section */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 p-3 bg-gray-800 border-b border-gray-700">
                 <h2 className="font-semibold">Income Sources</h2>
                 <div className="flex gap-2 w-full sm:w-auto">
                   <button onClick={() => { setEditingItem(null); setModal('income'); }} className="flex-1 sm:flex-none px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg">+ Recurring</button>
                   <button onClick={() => { setEditingItem(null); setModal('income-once'); }} className="flex-1 sm:flex-none px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded-lg">+ One-time</button>
+                  <button onClick={() => { setEditingItem(null); setModal('gig-income'); }} className="flex-1 sm:flex-none px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded-lg">+ Gig Income</button>
                 </div>
               </div>
               <div className="p-3 space-y-2">
-                {data.incomes.length === 0 ? (<div className="text-center py-8 text-gray-500"><div className="text-3xl mb-2">💵</div><div className="font-medium">No income sources yet</div></div>) : (
-                  data.incomes.map(income => (
-                    <div key={income.id} className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 bg-gray-800 border border-gray-700 rounded-lg">
-                      <div className="flex-1 min-w-0">
-                        <div className="font-medium truncate">{income.name}</div>
-                        <div className="text-xs text-gray-500">{frequencyLabels[income.frequency]} • {income.frequency === 'once' ? new Date(income.date! + 'T12:00:00').toLocaleDateString() : `Starting ${new Date(income.startDate! + 'T12:00:00').toLocaleDateString()}`}</div>
-                      </div>
-                      <div className="flex items-center justify-between sm:justify-end gap-2">
-                        <div className="font-mono text-emerald-400 font-semibold text-lg">{formatCurrency(income.amount)}</div>
-                        <div className="flex gap-2">
-                          <button onClick={() => { setEditingItem(income); setModal(income.frequency === 'once' ? 'income-once' : 'income'); }} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
-                          <button onClick={() => deleteIncome(income.id)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
+                {regularIncomes.length === 0 && gigIncomes.length === 0 ? (
+                  <div className="text-center py-8 text-gray-500">
+                    <div className="text-3xl mb-2">💵</div>
+                    <div className="font-medium">No income sources yet</div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Regular Income Items */}
+                    {regularIncomes.map(income => (
+                      <div key={income.id} className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 bg-gray-800 border border-gray-700 rounded-lg">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium truncate">{income.name}</div>
+                          <div className="text-xs text-gray-500">{frequencyLabels[income.frequency]} • {income.frequency === 'once' ? new Date(income.date! + 'T12:00:00').toLocaleDateString() : `Starting ${new Date(income.startDate! + 'T12:00:00').toLocaleDateString()}`}</div>
+                        </div>
+                        <div className="flex items-center justify-between sm:justify-end gap-2">
+                          <div className="font-mono text-emerald-400 font-semibold text-lg">{formatCurrency(income.amount)}</div>
+                          <div className="flex gap-2">
+                            <button onClick={() => { setEditingItem(income); setModal(income.frequency === 'once' ? 'income-once' : 'income'); }} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
+                            <button onClick={() => deleteIncome(income.id)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))
+                    ))}
+                  </>
                 )}
               </div>
             </div>
+
+            {/* Gig Income Section */}
+            {gigIncomes.length > 0 && (
+              <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+                <div className="p-3 bg-gray-800 border-b border-gray-700">
+                  <h2 className="font-semibold text-amber-400">Gig / Variable Income</h2>
+                </div>
+                <div className="p-3 space-y-3">
+                  {gigIncomes.map(gig => {
+                    const sortedPayments = [...(gig.scheduledPayments || [])].sort((a, b) => a.date.localeCompare(b.date));
+                    const totalScheduled = sortedPayments.reduce((sum, p) => sum + p.amount, 0);
+
+                    return (
+                      <div key={gig.id} className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
+                        {/* Gig Source Header */}
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 bg-gray-700/50">
+                          <div className="flex-1 min-w-0">
+                            <div className="font-medium truncate flex items-center gap-2">
+                              <span className="text-amber-400">●</span>
+                              {gig.name}
+                              {gig.payoutDay && (
+                                <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded capitalize">
+                                  {gig.payoutDay}s
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-xs text-gray-500">
+                              {sortedPayments.length} payment{sortedPayments.length !== 1 ? 's' : ''} scheduled
+                              {totalScheduled > 0 && ` • Total: ${formatCurrency(totalScheduled)}`}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => { setEditingItem(gig); setEditingGigPayment(null); setModal('gig-payment'); }}
+                              className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded"
+                            >
+                              Log Payment
+                            </button>
+                            <button
+                              onClick={() => { setEditingItem(gig); setModal('gig-income'); }}
+                              className="px-3 py-1.5 bg-gray-600 text-gray-300 rounded text-sm"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={() => deleteIncome(gig.id)}
+                              className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Scheduled Payments List */}
+                        {sortedPayments.length > 0 && (
+                          <div className="border-t border-gray-700">
+                            {sortedPayments.map(payment => (
+                              <div key={payment.id} className="flex items-center gap-2 px-3 py-2 border-b border-gray-700/50 last:border-b-0 hover:bg-gray-700/30">
+                                <div className="text-xs text-gray-500 w-20">
+                                  {new Date(payment.date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  {payment.note && (
+                                    <span className="text-xs text-gray-400 truncate">{payment.note}</span>
+                                  )}
+                                </div>
+                                <div className="font-mono text-emerald-400 text-sm font-semibold">
+                                  {formatCurrency(payment.amount)}
+                                </div>
+                                <div className="flex gap-1">
+                                  <button
+                                    onClick={() => { setEditingItem(gig); setEditingGigPayment(payment); setModal('gig-payment'); }}
+                                    className="px-2 py-1 bg-gray-700 text-gray-400 rounded text-xs hover:bg-gray-600"
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    onClick={() => deleteGigPayment(gig.id, payment.id)}
+                                    className="px-2 py-1 bg-red-500/10 text-red-400 rounded text-xs hover:bg-red-500/20"
+                                  >
+                                    ×
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Empty State for Gig */}
+                        {sortedPayments.length === 0 && (
+                          <div className="p-3 text-center text-gray-500 text-sm">
+                            No payments logged yet. Click "Log Payment" to add one.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1802,11 +2008,34 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       )}
       {modal === 'income-once' && (
         <Modal title={editingItem ? "Edit One-time Income" : "Add One-time Income"} onClose={() => { setModal(null); setEditingItem(null); }}>
-          <OneTimeIncomeForm 
-            income={editingItem as Income | null} 
-            onSave={handleSaveIncome} 
-            onClose={() => { setModal(null); setEditingItem(null); }} 
-            defaultDate={getDefaultDateInSelectedMonth()} 
+          <OneTimeIncomeForm
+            income={editingItem as Income | null}
+            onSave={handleSaveIncome}
+            onClose={() => { setModal(null); setEditingItem(null); }}
+            defaultDate={getDefaultDateInSelectedMonth()}
+          />
+        </Modal>
+      )}
+      {modal === 'gig-income' && (
+        <Modal title={editingItem ? "Edit Gig Income" : "Add Gig Income"} onClose={() => { setModal(null); setEditingItem(null); }}>
+          <GigIncomeForm
+            income={editingItem as Income | null}
+            onSave={handleSaveIncome}
+            onClose={() => { setModal(null); setEditingItem(null); }}
+          />
+        </Modal>
+      )}
+      {modal === 'gig-payment' && gigIncomes.length > 0 && (
+        <Modal
+          title={editingGigPayment ? "Edit Gig Payment" : "Log Gig Payment"}
+          onClose={() => { setModal(null); setEditingItem(null); setEditingGigPayment(null); }}
+        >
+          <GigPaymentForm
+            gigSources={gigIncomes}
+            selectedSourceId={editingItem?.id}
+            payment={editingGigPayment || undefined}
+            onSave={handleSaveGigPayment}
+            onClose={() => { setModal(null); setEditingItem(null); setEditingGigPayment(null); }}
           />
         </Modal>
       )}

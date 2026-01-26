@@ -23,14 +23,26 @@ export interface SplitConfig {
   secondAmount: number;
 }
 
+// Scheduled gig payment
+export interface ScheduledPayment {
+  id: string;           // Unique ID for this payment
+  date: string;         // YYYY-MM-DD
+  amount: number;
+  note?: string;        // e.g., "Tuesday shift", "Weekend delivery"
+}
+
 export interface Income {
   id: string;
   name: string;
   amount: number;
-  frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly';
+  frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'gig';
   startDate?: string;
   date?: string;
   overrides?: InstanceOverride[];
+
+  // Gig-specific fields:
+  payoutDay?: 'sunday' | 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday';
+  scheduledPayments?: ScheduledPayment[];
 }
 
 export interface CreditCard {
