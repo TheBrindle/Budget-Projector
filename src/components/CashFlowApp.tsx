@@ -1708,8 +1708,27 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                 </div>
                 <div className="p-3 space-y-3">
                   {gigIncomes.map(gig => {
-                    const sortedPayments = [...(gig.scheduledPayments || [])].sort((a, b) => a.date.localeCompare(b.date));
-                    const totalScheduled = sortedPayments.reduce((sum, p) => sum + p.amount, 0);
+                    const allPayments = [...(gig.scheduledPayments || [])].sort((a, b) => a.date.localeCompare(b.date));
+
+                    // Get first day of current month for filtering
+                    const now = new Date();
+                    const currentMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+
+                    // Split into past and current/future payments
+                    const pastPayments = allPayments.filter(p => p.date < currentMonthStart);
+                    const visiblePayments = allPayments.filter(p => p.date >= currentMonthStart);
+                    const visibleTotal = visiblePayments.reduce((sum, p) => sum + p.amount, 0);
+                    const pastTotal = pastPayments.reduce((sum, p) => sum + p.amount, 0);
+
+                    // Helper to clear all past payments
+                    const clearPastPayments = () => {
+                      const updatedPayments = allPayments.filter(p => p.date >= currentMonthStart);
+                      updateData({
+                        incomes: data.incomes.map(i =>
+                          i.id === gig.id ? { ...i, scheduledPayments: updatedPayments } : i
+                        )
+                      });
+                    };
 
                     return (
                       <div key={gig.id} className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
@@ -1726,8 +1745,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                               )}
                             </div>
                             <div className="text-xs text-gray-500">
-                              {sortedPayments.length} payment{sortedPayments.length !== 1 ? 's' : ''} scheduled
-                              {totalScheduled > 0 && ` • Total: ${formatCurrency(totalScheduled)}`}
+                              {visiblePayments.length} upcoming payment{visiblePayments.length !== 1 ? 's' : ''}
+                              {visibleTotal > 0 && ` • ${formatCurrency(visibleTotal)}`}
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
@@ -1752,10 +1771,25 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                           </div>
                         </div>
 
-                        {/* Scheduled Payments List */}
-                        {sortedPayments.length > 0 && (
+                        {/* Past Payments Summary */}
+                        {pastPayments.length > 0 && (
+                          <div className="flex items-center justify-between px-3 py-2 bg-gray-700/30 border-t border-gray-700 text-xs">
+                            <span className="text-gray-500">
+                              {pastPayments.length} past payment{pastPayments.length !== 1 ? 's' : ''} ({formatCurrency(pastTotal)})
+                            </span>
+                            <button
+                              onClick={clearPastPayments}
+                              className="text-gray-400 hover:text-red-400"
+                            >
+                              Clear history
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Visible Payments List (current month + future) */}
+                        {visiblePayments.length > 0 && (
                           <div className="border-t border-gray-700">
-                            {sortedPayments.map(payment => (
+                            {visiblePayments.map(payment => (
                               <div key={payment.id} className="flex items-center gap-2 px-3 py-2 border-b border-gray-700/50 last:border-b-0 hover:bg-gray-700/30">
                                 <div className="text-xs text-gray-500 w-20">
                                   {new Date(payment.date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
@@ -1788,9 +1822,14 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                         )}
 
                         {/* Empty State for Gig */}
-                        {sortedPayments.length === 0 && (
+                        {visiblePayments.length === 0 && pastPayments.length === 0 && (
                           <div className="p-3 text-center text-gray-500 text-sm">
                             No payments logged yet. Click "Log Payment" to add one.
+                          </div>
+                        )}
+                        {visiblePayments.length === 0 && pastPayments.length > 0 && (
+                          <div className="p-3 text-center text-gray-500 text-sm border-t border-gray-700">
+                            No upcoming payments. Click "Log Payment" to add one.
                           </div>
                         )}
                       </div>
