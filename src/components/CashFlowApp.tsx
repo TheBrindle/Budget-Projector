@@ -1054,13 +1054,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       for (let d = dayStart; d <= daysInThisMonth; d++) {
         data.incomes.forEach(income => {
           const occurrences = getOccurrencesInMonth(income, tempYear, tempMonth);
-          const occ = occurrences.find(o => o.day === d);
-          if (occ) balanceAtMonthStart += occ.amount;
+          occurrences.filter(o => o.day === d).forEach(occ => {
+            balanceAtMonthStart += occ.amount;
+          });
         });
         data.expenses.forEach(expense => {
           const occurrences = getOccurrencesInMonth(expense, tempYear, tempMonth);
-          const occ = occurrences.find(o => o.day === d);
-          if (occ) balanceAtMonthStart -= occ.amount;
+          occurrences.filter(o => o.day === d).forEach(occ => {
+            balanceAtMonthStart -= occ.amount;
+          });
         });
       }
       
@@ -1168,13 +1170,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       for (let d = dayStart; d <= dayEnd; d++) {
         data.incomes.forEach(income => {
           const occurrences = getOccurrencesInMonth(income, tempYear, tempMonth);
-          const occ = occurrences.find(o => o.day === d);
-          if (occ) balance += occ.amount;
+          occurrences.filter(o => o.day === d).forEach(occ => {
+            balance += occ.amount;
+          });
         });
         data.expenses.forEach(expense => {
           const occurrences = getOccurrencesInMonth(expense, tempYear, tempMonth);
-          const occ = occurrences.find(o => o.day === d);
-          if (occ) balance -= occ.amount;
+          occurrences.filter(o => o.day === d).forEach(occ => {
+            balance -= occ.amount;
+          });
         });
       }
       
