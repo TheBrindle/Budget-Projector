@@ -38,6 +38,7 @@ export interface Income {
   frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'gig';
   startDate?: string;
   date?: string;
+  endDate?: string; // YYYY-MM-DD. Last date this recurring item still occurs. History before this date stays visible; nothing projects after.
   overrides?: InstanceOverride[];
 
   // Gig-specific fields:
@@ -67,6 +68,7 @@ export interface Expense {
   frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'bimonthly' | 'quarterly' | 'payment_plan' | 'split';
   startDate?: string;
   date?: string;
+  endDate?: string; // YYYY-MM-DD. Last date this recurring item still occurs. History before this date stays visible; nothing projects after.
   category: string;
   creditCard?: CreditCard;
   paymentPlan?: PaymentPlan;

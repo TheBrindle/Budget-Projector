@@ -368,6 +368,19 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
   const monthEnd = new Date(year, month + 1, 0);
   const overrides = item.overrides || [];
 
+  // Drop any occurrences past endDate (inclusive), then dedupe + sort.
+  // endDate = "last date this recurring item occurs"; history before it stays.
+  const finalize = (occs: OccurrenceInfo[]): OccurrenceInfo[] => {
+    const filtered = item.endDate ? occs.filter(o => o.dateStr <= item.endDate!) : occs;
+    const seen = new Set<string>();
+    return filtered.filter(o => {
+      const key = o.dateStr + (o.isSplit ? '-split-' + o.amount : '');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).sort((a, b) => a.day - b.day);
+  };
+
   // Helper to check if a date is overridden (moved or skipped)
   const getOverride = (dateStr: string) => overrides.find(o => o.originalDate === dateStr);
   
@@ -504,7 +517,7 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
   if (item.frequency === 'once') {
     const itemDate = parseDate(item.date!);
     addOccurrence(itemDate);
-    return occurrences;
+    return finalize(occurrences);
   }
 
   // Handle gig frequency - return only scheduled payments in this month
@@ -524,7 +537,7 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
       }
     });
 
-    return occurrences.sort((a, b) => a.day - b.day);
+    return finalize(occurrences);
   }
 
   const start = parseDate(item.startDate || item.date!);
@@ -547,20 +560,20 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
         isSkipped: true,
         originalDate: dateStr
       });
-      return occurrences;
+      return finalize(occurrences);
     }
-    
+
     const ccStatus = getCreditCardBalanceAtMonth(expense, year, month);
-    
+
     // If paid off, no occurrence
     if (ccStatus.isPaidOff || ccStatus.paymentThisMonth <= 0) {
-      return occurrences;
+      return finalize(occurrences);
     }
-    
+
     // Check if we're before the start date
     const monthsFromStart = (year - start.getFullYear()) * 12 + (month - start.getMonth());
     if (monthsFromStart < 0) {
-      return occurrences;
+      return finalize(occurrences);
     }
     
     if (override && override.newDate) {
@@ -582,10 +595,10 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
         isOverride: false
       });
     }
-    
-    return occurrences;
+
+    return finalize(occurrences);
   }
-  
+
   // Handle split frequency separately (not part of payment plan frequencies)
   if (item.frequency === 'split') {
     const splitConfig = expense.splitConfig;
@@ -679,9 +692,9 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
         }
       }
     }
-    return occurrences;
+    return finalize(occurrences);
   }
-  
+
   const freq = expense.paymentPlan?.frequency || item.frequency;
   const maxPayments = expense.paymentPlan?.paymentCount || Infinity;
 
@@ -764,14 +777,7 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
     }
   }
   
-  // Remove duplicates by dateStr (allows multiple occurrences on same day for splits)
-  const seen = new Set<string>();
-  return occurrences.filter(o => {
-    const key = o.dateStr + (o.isSplit ? '-split-' + o.amount : '');
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).sort((a, b) => a.day - b.day);
+  return finalize(occurrences);
 };
 
 interface CashFlowAppProps { 
@@ -796,6 +802,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const [pastMonthDropdownOpen, setPastMonthDropdownOpen] = useState(false);
   const [oldMonthWarning, setOldMonthWarning] = useState<{ show: boolean; event: DayEvent | null; item: Income | Expense | null }>({ show: false, event: null, item: null });
   const [editingGigPayment, setEditingGigPayment] = useState<ScheduledPayment | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'income' | 'expense'; item: Income | Expense } | null>(null);
 
   const supabase = createClient();
 
@@ -879,6 +886,34 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const addExpense = (expense: Omit<Expense, 'id'>) => { updateData({ expenses: [...data.expenses, { ...expense, id: Date.now().toString() }] }); setModal(null); };
   const updateExpense = (id: string, updates: Partial<Expense>) => { updateData({ expenses: data.expenses.map(e => e.id === id ? { ...e, ...updates } : e) }); setModal(null); setEditingItem(null); };
   const deleteExpense = (id: string) => { updateData({ expenses: data.expenses.filter(e => e.id !== id) }); };
+
+  // Today as YYYY-MM-DD (local time)
+  const todayStr = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+
+  // Click handler for the × button on a recurring item.
+  // For non-recurring items (once / gig), just delete — there's no "history vs future" distinction.
+  // For recurring items, open the confirm modal so the user can choose: stop forward vs delete entirely.
+  const requestDeleteExpense = (expense: Expense) => {
+    if (expense.frequency === 'once') { deleteExpense(expense.id); return; }
+    setDeleteConfirm({ type: 'expense', item: expense });
+  };
+  const requestDeleteIncome = (income: Income) => {
+    if (income.frequency === 'once' || income.frequency === 'gig') { deleteIncome(income.id); return; }
+    setDeleteConfirm({ type: 'income', item: income });
+  };
+
+  // Stop the recurrence going forward without wiping history.
+  const stopExpenseForward = (id: string) => {
+    updateData({ expenses: data.expenses.map(e => e.id === id ? { ...e, endDate: todayStr() } : e) });
+    setDeleteConfirm(null);
+  };
+  const stopIncomeForward = (id: string) => {
+    updateData({ incomes: data.incomes.map(i => i.id === id ? { ...i, endDate: todayStr() } : i) });
+    setDeleteConfirm(null);
+  };
 
   // Gig income management functions
   const addGigPayment = (incomeId: string, payment: Omit<ScheduledPayment, 'id'>) => {
@@ -1685,16 +1720,33 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                   <>
                     {/* Regular Income Items */}
                     {regularIncomes.map(income => (
-                      <div key={income.id} className="flex flex-col sm:flex-row sm:items-center gap-2 p-3 bg-gray-800 border border-gray-700 rounded-lg">
+                      <div key={income.id} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 border rounded-lg ${income.endDate ? 'bg-gray-800/50 border-gray-700/50' : 'bg-gray-800 border-gray-700'}`}>
                         <div className="flex-1 min-w-0">
-                          <div className="font-medium truncate">{income.name}</div>
-                          <div className="text-xs text-gray-500">{frequencyLabels[income.frequency]} • {income.frequency === 'once' ? new Date(income.date! + 'T12:00:00').toLocaleDateString() : `Starting ${new Date(income.startDate! + 'T12:00:00').toLocaleDateString()}`}</div>
+                          <div className="font-medium truncate flex items-center gap-2">
+                            {income.name}
+                            {income.endDate && (
+                              <span className="text-xs bg-gray-700 text-gray-400 px-2 py-0.5 rounded">
+                                Stopped {new Date(income.endDate + 'T12:00:00').toLocaleDateString()}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-xs text-gray-500">
+                            {frequencyLabels[income.frequency]} • {income.frequency === 'once' ? new Date(income.date! + 'T12:00:00').toLocaleDateString() : `Starting ${new Date(income.startDate! + 'T12:00:00').toLocaleDateString()}`}
+                            {income.endDate && (
+                              <button
+                                onClick={() => updateData({ incomes: data.incomes.map(i => i.id === income.id ? { ...i, endDate: undefined } : i) })}
+                                className="ml-2 text-blue-400 hover:text-blue-300 underline"
+                              >
+                                Resume
+                              </button>
+                            )}
+                          </div>
                         </div>
                         <div className="flex items-center justify-between sm:justify-end gap-2">
                           <div className="font-mono text-emerald-400 font-semibold text-lg">{formatCurrency(income.amount)}</div>
                           <div className="flex gap-2">
                             <button onClick={() => { setEditingItem(income); setModal(income.frequency === 'once' ? 'income-once' : 'income'); }} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
-                            <button onClick={() => deleteIncome(income.id)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
+                            <button onClick={() => requestDeleteIncome(income)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
                           </div>
                         </div>
                       </div>
@@ -1878,15 +1930,20 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                             const catColor = getCategoryColor(expense.category, data.categoryColors);
                             const isPaidOff = ccBalance?.isPaidOff;
                             return (
-                            <div key={expense.id} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-lg border ${isPaidOff ? 'bg-green-500/5 border-green-500/20' : 'bg-gray-800 border-gray-700'}`}>
+                            <div key={expense.id} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-lg border ${isPaidOff ? 'bg-green-500/5 border-green-500/20' : expense.endDate ? 'bg-gray-800/50 border-gray-700/50' : 'bg-gray-800 border-gray-700'}`}>
                               <div className="flex-1 min-w-0">
                                 <div className="font-medium truncate flex items-center gap-2">
                                   <span className={`${catColor.text}`}>●</span>
                                   {expense.name}
                                   {isPaidOff && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">PAID OFF</span>}
+                                  {expense.endDate && !isPaidOff && (
+                                    <span className="text-xs bg-gray-700 text-gray-400 px-2 py-0.5 rounded">
+                                      Stopped {new Date(expense.endDate + 'T12:00:00').toLocaleDateString()}
+                                    </span>
+                                  )}
                                 </div>
                                 <div className="text-xs text-gray-500 ml-4">
-                                  {frequencyLabels[expense.frequency]} 
+                                  {frequencyLabels[expense.frequency]}
                                   {expense.creditCard && (
                                     isPaidOff ? (
                                       <span className="text-green-400"> • Original: {formatCurrency(expense.creditCard.totalDebt)} — Paid off!</span>
@@ -1915,13 +1972,21 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                       {` • Day ${expense.splitConfig.firstDay}: ${formatCurrency(expense.splitConfig.firstAmount)}, Day ${expense.splitConfig.secondDay}: ${formatCurrency(expense.splitConfig.secondAmount)}`}
                                     </span>
                                   )}
+                                  {expense.endDate && (
+                                    <button
+                                      onClick={() => updateData({ expenses: data.expenses.map(e => e.id === expense.id ? { ...e, endDate: undefined } : e) })}
+                                      className="ml-2 text-blue-400 hover:text-blue-300 underline"
+                                    >
+                                      Resume
+                                    </button>
+                                  )}
                                 </div>
                               </div>
                               <div className="flex items-center justify-between sm:justify-end gap-2">
                                 <div className={`font-mono font-semibold text-lg ${isPaidOff ? 'text-green-400' : catColor.text}`}>{formatCurrency(expense.amount)}/mo</div>
                                 <div className="flex gap-2">
                                   <button onClick={() => { setEditingItem(expense); setModal(expense.category === 'credit_card' ? 'credit-card' : expense.frequency === 'payment_plan' ? 'payment-plan' : expense.frequency === 'once' ? 'expense-once' : 'expense'); }} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
-                                  <button onClick={() => deleteExpense(expense.id)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
+                                  <button onClick={() => requestDeleteExpense(expense)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
                                 </div>
                               </div>
                             </div>
@@ -2182,11 +2247,54 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
             >
               Cancel
             </button>
-            <button 
+            <button
               onClick={confirmOldMonthEdit}
               className="px-4 py-2 bg-yellow-600 text-white rounded-lg font-medium"
             >
               Yes, Edit This Transaction
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Delete Recurring Item Modal */}
+      {deleteConfirm && (
+        <Modal title={`Remove ${deleteConfirm.item.name}?`} onClose={() => setDeleteConfirm(null)}>
+          <div className="p-4 space-y-3">
+            <div className="text-sm text-gray-300">
+              This is a recurring {deleteConfirm.type}. Past occurrences are projections derived from this entry, so deleting it removes them from your history too.
+            </div>
+            <div className="text-sm text-gray-400">
+              Choose how you want to remove it:
+            </div>
+          </div>
+          <div className="p-4 pt-0 space-y-2">
+            <button
+              onClick={() => {
+                if (deleteConfirm.type === 'expense') stopExpenseForward(deleteConfirm.item.id);
+                else stopIncomeForward(deleteConfirm.item.id);
+              }}
+              className="w-full px-4 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-left"
+            >
+              <div>Stop going forward</div>
+              <div className="text-xs text-blue-200 font-normal mt-0.5">Keeps history visible. Sets end date to today.</div>
+            </button>
+            <button
+              onClick={() => {
+                if (deleteConfirm.type === 'expense') deleteExpense(deleteConfirm.item.id);
+                else deleteIncome(deleteConfirm.item.id);
+                setDeleteConfirm(null);
+              }}
+              className="w-full px-4 py-3 bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/30 rounded-lg font-medium text-left"
+            >
+              <div>Delete entirely</div>
+              <div className="text-xs text-red-300/70 font-normal mt-0.5">Removes all past and future occurrences.</div>
+            </button>
+            <button
+              onClick={() => setDeleteConfirm(null)}
+              className="w-full px-4 py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg"
+            >
+              Cancel
             </button>
           </div>
         </Modal>
