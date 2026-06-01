@@ -1929,6 +1929,10 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                             const ccBalance = expense.creditCard ? getCreditCardRemainingBalance(expense) : null;
                             const catColor = getCategoryColor(expense.category, data.categoryColors);
                             const isPaidOff = ccBalance?.isPaidOff;
+                            const openEditor = () => {
+                              setEditingItem(expense);
+                              setModal(expense.category === 'credit_card' ? 'credit-card' : expense.frequency === 'payment_plan' ? 'payment-plan' : expense.frequency === 'once' ? 'expense-once' : 'expense');
+                            };
                             return (
                             <div key={expense.id} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-lg border ${isPaidOff ? 'bg-green-500/5 border-green-500/20' : expense.endDate ? 'bg-gray-800/50 border-gray-700/50' : 'bg-gray-800 border-gray-700'}`}>
                               <div className="flex-1 min-w-0">
@@ -1981,11 +1985,30 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                     </button>
                                   )}
                                 </div>
+                                {isPaidOff && (
+                                  <div className="mt-2 ml-4 flex flex-wrap items-center gap-2 p-2 bg-green-500/10 border border-green-500/20 rounded-lg">
+                                    <span className="text-xs text-green-300">Balance cleared — adjust or remove this expense?</span>
+                                    <div className="flex gap-2">
+                                      <button
+                                        onClick={openEditor}
+                                        className="px-2.5 py-1 bg-green-600/20 hover:bg-green-600/30 text-green-300 border border-green-500/30 rounded text-xs font-medium"
+                                      >
+                                        Adjust balance
+                                      </button>
+                                      <button
+                                        onClick={() => requestDeleteExpense(expense)}
+                                        className="px-2.5 py-1 bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 rounded text-xs font-medium"
+                                      >
+                                        Remove
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
                               </div>
                               <div className="flex items-center justify-between sm:justify-end gap-2">
                                 <div className={`font-mono font-semibold text-lg ${isPaidOff ? 'text-green-400' : catColor.text}`}>{formatCurrency(expense.amount)}/mo</div>
                                 <div className="flex gap-2">
-                                  <button onClick={() => { setEditingItem(expense); setModal(expense.category === 'credit_card' ? 'credit-card' : expense.frequency === 'payment_plan' ? 'payment-plan' : expense.frequency === 'once' ? 'expense-once' : 'expense'); }} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
+                                  <button onClick={openEditor} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
                                   <button onClick={() => requestDeleteExpense(expense)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
                                 </div>
                               </div>
