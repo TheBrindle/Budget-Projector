@@ -25,6 +25,11 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
     minimumPayment: expense?.creditCard?.minimumPayment?.toString() || ''
   });
 
+  // Optional end date — lets this card stop on a specific date (e.g., if you move or transfer the balance)
+  const [endDate, setEndDate] = useState(expense?.endDate || '');
+  const startDateStr = `${form.startMonth}-${String(form.dayOfMonth).padStart(2, '0')}`;
+  const endBeforeStart = endDate !== '' && endDate < startDateStr;
+
   // Calculate payoff details
   const payoffCalc = useMemo(() => {
     if (!form.amount || !form.currentBalance) return null;
@@ -82,15 +87,15 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
 
   const handleSave = () => {
     if (!form.name || !form.amount || !form.currentBalance) return;
-    
-    const startDate = `${form.startMonth}-${String(form.dayOfMonth).padStart(2, '0')}`;
+
     const currentBalance = parseFloat(form.currentBalance);
-    
+
     onSave({
       name: form.name,
       amount: parseFloat(form.amount),
       frequency: 'monthly',
-      startDate,
+      startDate: startDateStr,
+      endDate: endDate || undefined,
       category: 'credit_card',
       creditCard: {
         totalDebt: parseFloat(form.originalDebt) || currentBalance,
@@ -102,7 +107,7 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
     });
   };
 
-  const isValid = form.name && form.amount && form.currentBalance && payoffCalc && payoffCalc.months > 0;
+  const isValid = form.name && form.amount && form.currentBalance && payoffCalc && payoffCalc.months > 0 && !endBeforeStart;
 
   const dayOptions = Array.from({ length: 31 }, (_, i) => i + 1);
   
@@ -229,7 +234,36 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
             </select>
           </div>
         </div>
-        
+
+        {/* Optional end date — lets this card stop on a specific date (e.g., if you move or transfer the balance) */}
+        <div>
+          <label className="text-xs text-gray-500 uppercase block mb-1">Ends On (optional)</label>
+          <div className="flex gap-2">
+            <input
+              type="date"
+              value={endDate}
+              min={startDateStr}
+              onChange={e => setEndDate(e.target.value)}
+              className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
+            />
+            {endDate && (
+              <button
+                type="button"
+                onClick={() => setEndDate('')}
+                className="px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded-lg text-sm whitespace-nowrap"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            {endDate ? 'Nothing projects after this date; past entries stay visible.' : 'Leave blank to continue until the balance is paid off.'}
+          </p>
+          {endBeforeStart && (
+            <p className="text-xs text-red-400 mt-1">End date can&apos;t be before the first payment.</p>
+          )}
+        </div>
+
         {payoffCalc && (
           <div className={`p-4 rounded-lg border ${payoffCalc.months < 0 ? 'bg-red-500/10 border-red-500/30' : 'bg-purple-500/10 border-purple-500/30'}`}>
             {payoffCalc.months < 0 ? (

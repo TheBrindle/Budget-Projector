@@ -92,19 +92,26 @@ export default function PaymentPlanForm({ expense, onSave, onClose, defaultMonth
     return end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   }, [form.startDate, form.paymentCount, form.paymentFrequency, form.firstDay, validSecondDay]);
 
+  // Optional manual end date — stops the plan early (e.g., paid off or transferred).
+  // Distinct from the natural final-payment date computed above.
+  const [stopDate, setStopDate] = useState(expense?.endDate || '');
+  const seriesStartStr = form.startDate.substring(0, 7) + '-' + String(form.firstDay).padStart(2, '0');
+  const endBeforeStart = stopDate !== '' && stopDate < seriesStartStr;
+
   const handleSave = () => {
     if (!form.name || !form.amount || !form.totalDebt || !form.paymentCount) return;
-    
+
     const parts = form.startDate.split('-');
     const year = parts[0];
     const month = parts[1];
     const startDateStr = year + '-' + month + '-' + String(form.firstDay).padStart(2, '0');
-    
+
     onSave({
       name: form.name,
       amount: parseFloat(form.amount),
       frequency: 'payment_plan',
       startDate: startDateStr,
+      endDate: stopDate || undefined,
       category: form.category,
       paymentPlan: {
         totalDebt: parseFloat(form.totalDebt),
@@ -115,7 +122,7 @@ export default function PaymentPlanForm({ expense, onSave, onClose, defaultMonth
     });
   };
 
-  const isValid = form.name && form.amount && form.totalDebt && form.paymentCount;
+  const isValid = form.name && form.amount && form.totalDebt && form.paymentCount && !endBeforeStart;
 
   const totalPayments = useMemo(() => {
     if (!form.paymentCount) return 0;
@@ -299,6 +306,35 @@ export default function PaymentPlanForm({ expense, onSave, onClose, defaultMonth
             <div className="text-xs text-teal-400/70 mt-1">Final payment: {endDate}</div>
           </div>
         )}
+
+        {/* Optional end date — stops the plan early (e.g., paid off, transferred, or moving) */}
+        <div>
+          <label className="text-xs text-gray-500 uppercase block mb-1">Ends On (optional)</label>
+          <div className="flex gap-2">
+            <input
+              type="date"
+              value={stopDate}
+              min={seriesStartStr}
+              onChange={e => setStopDate(e.target.value)}
+              className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
+            />
+            {stopDate && (
+              <button
+                type="button"
+                onClick={() => setStopDate('')}
+                className="px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded-lg text-sm whitespace-nowrap"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            {stopDate ? 'Nothing projects after this date; past entries stay visible.' : 'Leave blank to run through the final payment.'}
+          </p>
+          {endBeforeStart && (
+            <p className="text-xs text-red-400 mt-1">End date can&apos;t be before the first payment.</p>
+          )}
+        </div>
       </div>
       <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
         <button type="button" onClick={onClose} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Cancel</button>
