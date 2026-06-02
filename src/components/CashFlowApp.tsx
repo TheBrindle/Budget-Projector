@@ -2212,12 +2212,18 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       )}
       {modal === 'instance-edit' && editingEvent && editingItem && (
         <Modal title={`Edit ${editingEvent.name}`} onClose={() => { setModal(null); setEditingItem(null); setEditingEvent(null); }}>
-          <InstanceEditForm 
-            event={editingEvent} 
-            item={editingItem} 
+          <InstanceEditForm
+            event={editingEvent}
+            item={editingItem}
             onSave={handleSaveInstanceOverride}
             onRemoveOverride={handleRemoveInstanceOverride}
             onEditRecurring={handleEditRecurring}
+            onSetDuration={(endDate) => {
+              if (!editingItem || !editingEvent) return;
+              if (editingEvent.type === 'income') updateIncome(editingItem.id, { endDate });
+              else updateExpense(editingItem.id, { endDate });
+              setModal(null); setEditingItem(null); setEditingEvent(null);
+            }}
             onClose={() => { setModal(null); setEditingItem(null); setEditingEvent(null); }}
             creditCardBalance={
               (editingItem as Expense).creditCard 

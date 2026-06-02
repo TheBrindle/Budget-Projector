@@ -38,12 +38,14 @@ interface InstanceEditFormProps {
   onSave: (override: InstanceOverride) => void;
   onRemoveOverride: () => void;
   onEditRecurring: () => void;
+  // Set the whole series' end date (generic optional "duration") — undefined clears it
+  onSetDuration: (endDate: string | undefined) => void;
   onClose: () => void;
   // Optional: pass current balance for credit cards
   creditCardBalance?: number;
 }
 
-export default function InstanceEditForm({ event, item, onSave, onRemoveOverride, onEditRecurring, onClose, creditCardBalance }: InstanceEditFormProps) {
+export default function InstanceEditForm({ event, item, onSave, onRemoveOverride, onEditRecurring, onSetDuration, onClose, creditCardBalance }: InstanceEditFormProps) {
   const existingOverride = item.overrides?.find(o => o.originalDate === (event.originalDate || event.instanceDate));
   
   const [newDate, setNewDate] = useState(existingOverride?.split ? existingOverride.newDate || event.instanceDate : event.instanceDate);
@@ -60,6 +62,9 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
     existingOverride?.split?.firstAmount?.toString() || Math.floor(event.amount / 2).toString()
   );
   const [splitSecondDate, setSplitSecondDate] = useState(existingOverride?.split?.secondDate || '');
+
+  // Generic optional end date for the WHOLE series (e.g., a utility bill that ends when you move)
+  const [endDate, setEndDate] = useState(item.endDate || '');
 
   const isRecurring = item.frequency !== 'once';
   const originalDate = event.originalDate || event.instanceDate;
@@ -78,6 +83,11 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
   const totalAmount = parseFloat(newAmount) || event.amount;
   const firstAmount = parseFloat(splitFirstAmount) || 0;
   const secondAmount = totalAmount - firstAmount;
+
+  // Duration (whole-series end date) guards
+  const endBeforeStart = endDate !== '' && !!item.startDate && endDate < item.startDate;
+  const durationChanged = (endDate || undefined) !== (item.endDate || undefined);
+  const durationLabel = !endDate && item.endDate ? 'Remove end date' : 'Save end date';
 
   // Credit card payoff calculations
   const ccProjection = useMemo(() => {
@@ -373,13 +383,50 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
             {/* Note */}
             <div>
               <label className="text-xs text-gray-500 uppercase block mb-1">Note (optional)</label>
-              <input 
-                type="text" 
-                value={note} 
-                onChange={e => setNote(e.target.value)} 
-                className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white" 
+              <input
+                type="text"
+                value={note}
+                onChange={e => setNote(e.target.value)}
+                className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
                 placeholder={isSkipped ? 'e.g., Restored - paying late' : isCreditCard ? 'e.g., Bonus payment from gift' : 'e.g., Paying early this month'}
               />
+            </div>
+
+            {/* Duration — generic optional end date for the WHOLE series, not just this date */}
+            <div className="border border-gray-700 rounded-lg p-3 space-y-2">
+              <label className="text-xs text-gray-500 uppercase block">Ends On (optional)</label>
+              <div className="flex gap-2">
+                <input
+                  type="date"
+                  value={endDate}
+                  min={item.startDate}
+                  onChange={e => setEndDate(e.target.value)}
+                  className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
+                />
+                {endDate && (
+                  <button
+                    type="button"
+                    onClick={() => setEndDate('')}
+                    className="px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded-lg text-sm whitespace-nowrap"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-gray-500">
+                Applies to the whole {event.type}, not just this date — e.g., a bill that ends when you move. Leave blank to continue indefinitely.
+              </p>
+              {endBeforeStart && (
+                <p className="text-xs text-red-400">End date can&apos;t be before the start date.</p>
+              )}
+              <button
+                type="button"
+                onClick={() => onSetDuration(endDate || undefined)}
+                disabled={endBeforeStart || !durationChanged}
+                className="w-full px-4 py-2 bg-blue-500/10 text-blue-400 rounded-lg text-sm hover:bg-blue-500/20 disabled:opacity-50"
+              >
+                {durationLabel}
+              </button>
             </div>
           </>
         )}
