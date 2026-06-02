@@ -56,9 +56,13 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
   );
   const [apr, setApr] = useState(expense?.creditCard?.apr?.toString() ?? '0');
 
+  // Optional end date — the last date this recurring expense occurs (its "duration")
+  const [endDate, setEndDate] = useState(expense?.endDate || '');
+
   const total = parseFloat(form.amount) || 0;
   const first = parseFloat(firstAmount) || 0;
   const second = total - first;
+  const endBeforeStart = endDate !== '' && endDate < form.startDate;
 
   // Live payoff projection (mirrors CreditCardForm). months = -1 means it never pays off.
   const payoffCalc = useMemo(() => {
@@ -101,7 +105,10 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
       amount: parseFloat(form.amount),
       frequency: form.frequency as Expense['frequency'],
       startDate: form.startDate,
-      category: form.category
+      category: form.category,
+      // Optional duration — the last date this recurring item occurs.
+      // Write undefined when cleared so editing removes any previously-saved end date.
+      endDate: endDate || undefined
     };
 
     // Add split config if frequency is split
@@ -264,6 +271,35 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
           </div>
         )}
 
+        {/* Optional end date — the duration / last date this recurring expense occurs */}
+        <div>
+          <label className="text-xs text-gray-500 uppercase block mb-1">Ends On (optional)</label>
+          <div className="flex gap-2">
+            <input
+              type="date"
+              value={endDate}
+              min={form.startDate}
+              onChange={e => setEndDate(e.target.value)}
+              className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
+            />
+            {endDate && (
+              <button
+                type="button"
+                onClick={() => setEndDate('')}
+                className="px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded-lg text-sm whitespace-nowrap"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            {endDate ? 'Nothing projects after this date; past entries stay visible.' : 'Leave blank to continue indefinitely.'}
+          </p>
+          {endBeforeStart && (
+            <p className="text-xs text-red-400 mt-1">End date can&apos;t be before the start date.</p>
+          )}
+        </div>
+
         {/* Optional balance / payoff tracking — monthly only (payoff engine is monthly) */}
         {form.frequency === 'monthly' && (
           <div className="border border-purple-500/30 rounded-lg overflow-hidden">
@@ -353,7 +389,7 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
         <button 
           type="button" 
           onClick={handleSave} 
-          disabled={!form.name || !form.amount || (form.frequency === 'split' && second < 0) || (trackBalance && form.frequency === 'monthly' && (!currentBalance || (payoffCalc?.months ?? 0) <= 0))}
+          disabled={!form.name || !form.amount || endBeforeStart || (form.frequency === 'split' && second < 0) || (trackBalance && form.frequency === 'monthly' && (!currentBalance || (payoffCalc?.months ?? 0) <= 0))}
           className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium disabled:opacity-50"
         >
           Save

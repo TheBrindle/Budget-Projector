@@ -1942,7 +1942,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                   {isPaidOff && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">PAID OFF</span>}
                                   {expense.endDate && !isPaidOff && (
                                     <span className="text-xs bg-gray-700 text-gray-400 px-2 py-0.5 rounded">
-                                      Stopped {new Date(expense.endDate + 'T12:00:00').toLocaleDateString()}
+                                      {expense.endDate < new Date().toISOString().split('T')[0] ? 'Stopped' : 'Ends'} {new Date(expense.endDate + 'T12:00:00').toLocaleDateString()}
                                     </span>
                                   )}
                                 </div>
