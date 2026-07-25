@@ -2,34 +2,16 @@
 
 import { useState, useMemo } from 'react';
 import { DayEvent, Income, Expense, InstanceOverride } from '@/lib/types';
+import { projectPayoff } from '@/lib/payoff';
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 
-// Calculate months to payoff given a balance, payment, and APR
-const calculatePayoff = (balance: number, payment: number, apr: number): { months: number; totalInterest: number } => {
+// Months to payoff for a balance paid down at this expense's own frequency.
+const calculatePayoff = (balance: number, payment: number, apr: number, frequency: string): { months: number; totalInterest: number } => {
   if (balance <= 0) return { months: 0, totalInterest: 0 };
-  if (payment <= 0) return { months: -1, totalInterest: 0 };
-  
-  const monthlyRate = (apr / 100) / 12;
-  
-  // Check if payment covers interest
-  if (apr > 0 && payment <= balance * monthlyRate) {
-    return { months: -1, totalInterest: 0 }; // Will never pay off
-  }
-  
-  let remaining = balance;
-  let months = 0;
-  let totalInterest = 0;
-  const maxMonths = 600;
-  
-  while (remaining > 0.01 && months < maxMonths) {
-    const interest = remaining * monthlyRate;
-    totalInterest += interest;
-    remaining = remaining + interest - payment;
-    months++;
-  }
-  
-  return { months, totalInterest };
+  const projection = projectPayoff(balance, [payment], apr, frequency);
+  if (!projection) return { months: -1, totalInterest: 0 };
+  return { months: projection.months, totalInterest: projection.totalInterest };
 };
 
 interface InstanceEditFormProps {
@@ -41,11 +23,11 @@ interface InstanceEditFormProps {
   // Set the whole series' end date (generic optional "duration") — undefined clears it
   onSetDuration: (endDate: string | undefined) => void;
   onClose: () => void;
-  // Optional: pass current balance for credit cards
-  creditCardBalance?: number;
+  // Optional: balance remaining at this instance, for balance-tracked expenses
+  trackedBalance?: number;
 }
 
-export default function InstanceEditForm({ event, item, onSave, onRemoveOverride, onEditRecurring, onSetDuration, onClose, creditCardBalance }: InstanceEditFormProps) {
+export default function InstanceEditForm({ event, item, onSave, onRemoveOverride, onEditRecurring, onSetDuration, onClose, trackedBalance }: InstanceEditFormProps) {
   const existingOverride = item.overrides?.find(o => o.originalDate === (event.originalDate || event.instanceDate));
   
   const [newDate, setNewDate] = useState(existingOverride?.split ? existingOverride.newDate || event.instanceDate : event.instanceDate);
@@ -71,11 +53,11 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
   const isSkipped = event.isSkipped;
   const isSplitExpense = (item as Expense).frequency === 'split';
   
-  // Check if this is a credit card payment
+  // Any expense can carry a balance (credit card, loan, or a converted expense)
   const expense = item as Expense;
-  const isCreditCard = expense.category === 'credit_card' && expense.creditCard;
   const cc = expense.creditCard;
-  
+  const isCreditCard = !!cc;
+
   // Check if this is an expense that can be split (food, entertainment, other categories)
   const canSplit = event.type === 'expense' && isRecurring && !isSkipped && !isSplitExpense && !isCreditCard &&
     ['food', 'entertainment', 'other'].includes(expense.category || '');
@@ -89,27 +71,28 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
   const durationChanged = (endDate || undefined) !== (item.endDate || undefined);
   const durationLabel = !endDate && item.endDate ? 'Remove end date' : 'Save end date';
 
-  // Credit card payoff calculations
+  // Payoff impact of changing this single payment
   const ccProjection = useMemo(() => {
-    if (!isCreditCard || !cc || !creditCardBalance) return null;
-    
-    const balance = creditCardBalance;
+    if (!isCreditCard || !cc || !trackedBalance) return null;
+
+    const balance = trackedBalance;
     const apr = cc.apr || 0;
+    const frequency = expense.frequency;
     const regularPayment = item.amount;
     const adjustedPayment = parseFloat(newAmount) || regularPayment;
-    
+
     // Calculate with regular payment
-    const regularPayoff = calculatePayoff(balance, regularPayment, apr);
-    
+    const regularPayoff = calculatePayoff(balance, regularPayment, apr, frequency);
+
     // Calculate with adjusted payment (just this one payment different)
     // For simplicity, if this payment is higher, subtract the extra from balance first
     const extraPayment = adjustedPayment - regularPayment;
     const adjustedBalance = Math.max(0, balance - extraPayment);
-    const adjustedPayoff = calculatePayoff(adjustedBalance, regularPayment, apr);
-    
+    const adjustedPayoff = calculatePayoff(adjustedBalance, regularPayment, apr, frequency);
+
     const monthsSaved = regularPayoff.months - adjustedPayoff.months;
     const interestSaved = regularPayoff.totalInterest - adjustedPayoff.totalInterest;
-    
+
     return {
       balance,
       regularPayment,
@@ -120,7 +103,7 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
       interestSaved,
       apr
     };
-  }, [isCreditCard, cc, creditCardBalance, item.amount, newAmount]);
+  }, [isCreditCard, cc, expense.frequency, trackedBalance, item.amount, newAmount]);
 
   const handleSave = () => {
     const override: InstanceOverride = {
@@ -179,7 +162,9 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
             <span className={isSkipped ? 'line-through text-gray-400' : ''}>{event.name}</span>
           </div>
           <div className="text-sm text-gray-400">
-            {isCreditCard ? 'Credit card payment' : isRecurring ? (isSplitExpense ? 'Split payment' : 'Recurring') : 'One-time'} {event.type}
+            {isCreditCard
+              ? (expense.category === 'credit_card' ? 'Credit card payment' : 'Balance payment')
+              : isRecurring ? (isSplitExpense ? 'Split payment' : 'Recurring') : 'One-time'} {event.type}
             {event.splitPart && <span className="ml-1 text-cyan-400">(Part {event.splitPart} of 2)</span>}
             {isSkipped && <span className="ml-2 text-gray-500 font-semibold">(SKIPPED)</span>}
             {event.isOverride && !isSkipped && <span className="ml-2 text-yellow-400">(Modified)</span>}
@@ -189,7 +174,7 @@ export default function InstanceEditForm({ event, item, onSave, onRemoveOverride
           </div>
         </div>
 
-        {/* Credit Card Balance Info */}
+        {/* Remaining balance + payoff outlook */}
         {isCreditCard && ccProjection && (
           <div className="p-3 bg-purple-500/10 border border-purple-500/30 rounded-lg space-y-2">
             <div className="flex justify-between items-center">

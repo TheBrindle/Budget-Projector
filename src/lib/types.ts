@@ -33,6 +33,11 @@ export interface ScheduledPayment {
 
 export interface Income {
   id: string;
+  // Versions of the same real-world item share a seriesId. When something changes
+  // for real (a raise, a restructure), the old version is capped with an endDate
+  // and a new version takes over — so past months keep the amounts that actually
+  // happened instead of being recalculated from today's numbers.
+  seriesId?: string;
   name: string;
   amount: number;
   frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'gig';
@@ -46,6 +51,9 @@ export interface Income {
   scheduledPayments?: ScheduledPayment[];
 }
 
+// Balance tracking for an expense. Named for its original credit-card use, but
+// any recurring expense can carry one: the balance is amortized across that
+// expense's own payment schedule, whatever its frequency.
 export interface CreditCard {
   totalDebt: number; // Original total debt (for reference)
   currentBalance: number; // Balance as of balanceAsOfDate
@@ -63,6 +71,7 @@ export interface PaymentPlan {
 
 export interface Expense {
   id: string;
+  seriesId?: string; // See Income.seriesId — versions of one real-world expense
   name: string;
   amount: number; // Total amount (for split: firstAmount + secondAmount)
   frequency: 'once' | 'weekly' | 'biweekly' | 'semimonthly' | 'monthly' | 'bimonthly' | 'quarterly' | 'payment_plan' | 'split';
@@ -70,10 +79,31 @@ export interface Expense {
   date?: string;
   endDate?: string; // YYYY-MM-DD. Last date this recurring item still occurs. History before this date stays visible; nothing projects after.
   category: string;
-  creditCard?: CreditCard;
+  creditCard?: CreditCard; // Optional balance to pay down — works on any frequency, not just credit cards
   paymentPlan?: PaymentPlan;
   splitConfig?: SplitConfig; // Required when frequency is 'split'
   overrides?: InstanceOverride[];
+}
+
+// A real bank balance recorded on a real date. Projections re-anchor to the most
+// recent checkpoint, and comparing each one against what the projection predicted
+// is how the app measures whether the budget matches reality.
+export interface BalanceCheckpoint {
+  id: string;
+  date: string; // YYYY-MM-DD
+  actualBalance: number;
+  note?: string;
+}
+
+// A sandbox fork of the budget. Only incomes and expenses are copied — the
+// starting balance and recorded checkpoints are facts about reality, so every
+// scenario branches from the same factual starting point.
+export interface Scenario {
+  id: string;
+  name: string;
+  createdAt: string; // YYYY-MM-DD
+  incomes: Income[];
+  expenses: Expense[];
 }
 
 export interface CashFlowData {
@@ -86,6 +116,8 @@ export interface CashFlowData {
   incomes: Income[];
   expenses: Expense[];
   categoryColors?: Record<string, string>; // category value -> color key
+  checkpoints?: BalanceCheckpoint[];
+  scenarios?: Scenario[];
 }
 
 // Available colors for categories
@@ -124,6 +156,7 @@ export interface DayEvent {
   splitPart?: 1 | 2; // Which part of a split payment (1 = first, 2 = second)
   originalDate?: string;
   instanceDate: string; // The actual date of this instance (YYYY-MM-DD)
+  runningBalance?: number; // Balance immediately after this transaction
 }
 
 export interface DayData {

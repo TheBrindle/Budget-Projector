@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import { Expense, SplitConfig } from '@/lib/types';
+import { projectPayoff, paymentCadenceLabel } from '@/lib/payoff';
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 
@@ -64,31 +65,16 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
   const second = total - first;
   const endBeforeStart = endDate !== '' && endDate < form.startDate;
 
-  // Live payoff projection (mirrors CreditCardForm). months = -1 means it never pays off.
+  // Live payoff projection, using this expense's own payment frequency.
+  // months = -1 means the payment never clears the balance.
   const payoffCalc = useMemo(() => {
-    const payment = parseFloat(form.amount);
     const debt = parseFloat(currentBalance);
-    const rate = (parseFloat(apr) || 0) / 100 / 12;
-    if (!payment || !debt || payment <= 0 || debt <= 0) return null;
-
-    if (rate === 0) {
-      const months = Math.ceil(debt / payment);
-      return { months, totalPaid: payment * months, totalInterest: 0 };
-    }
-    if (payment <= debt * rate) return { months: -1, totalPaid: 0, totalInterest: 0 };
-
-    let remaining = debt;
-    let months = 0;
-    let totalPaid = 0;
-    while (remaining > 0.01 && months < 600) {
-      remaining += remaining * rate;
-      remaining -= payment;
-      totalPaid += payment;
-      months++;
-      if (remaining < 0) { totalPaid += remaining; remaining = 0; }
-    }
-    return { months, totalPaid, totalInterest: totalPaid - debt };
-  }, [form.amount, currentBalance, apr]);
+    if (!debt || debt <= 0) return null;
+    // Split monthly pays two different amounts per month; everything else pays
+    // the same amount every period.
+    const cycle = form.frequency === 'split' ? [first, second] : [parseFloat(form.amount)];
+    return projectPayoff(debt, cycle, parseFloat(apr) || 0, form.frequency);
+  }, [form.amount, form.frequency, first, second, currentBalance, apr]);
 
   // Auto-set first amount to half when switching to split or when amount changes
   useEffect(() => {
@@ -121,9 +107,10 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
       };
     }
 
-    // Attach balance/payoff tracking (monthly only — the payoff engine is monthly).
+    // Attach balance/payoff tracking. Works on any recurring frequency — the
+    // balance amortizes across whatever schedule this expense already follows.
     // Set undefined when off so editing clears any previously-saved balance.
-    if (trackBalance && form.frequency === 'monthly' && parseFloat(currentBalance) > 0) {
+    if (trackBalance && parseFloat(currentBalance) > 0) {
       const balance = parseFloat(currentBalance);
       expenseData.creditCard = {
         totalDebt: expense?.creditCard?.totalDebt ?? balance,
@@ -300,9 +287,8 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
           )}
         </div>
 
-        {/* Optional balance / payoff tracking — monthly only (payoff engine is monthly) */}
-        {form.frequency === 'monthly' && (
-          <div className="border border-purple-500/30 rounded-lg overflow-hidden">
+        {/* Optional balance / payoff tracking — available on any recurring frequency */}
+        <div className="border border-purple-500/30 rounded-lg overflow-hidden">
             <button
               type="button"
               onClick={() => setTrackBalance(!trackBalance)}
@@ -310,7 +296,9 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
             >
               <div>
                 <h3 className="font-medium text-purple-400">Track a balance / project payoff</h3>
-                <p className="text-xs text-gray-400 mt-1">Optional — like a credit card. The Amount above is the monthly payment.</p>
+                <p className="text-xs text-gray-400 mt-1">
+                  Optional — like a credit card or loan. The Amount above is paid {paymentCadenceLabel(form.frequency)} until the balance reaches $0.
+                </p>
               </div>
               <span className={`text-2xl leading-none ${trackBalance ? 'text-purple-400' : 'text-gray-600'}`}>
                 {trackBalance ? '−' : '+'}
@@ -359,37 +347,41 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
                     {payoffCalc.months < 0 ? (
                       <div className="text-red-400 text-sm">
                         <div className="font-semibold">Payment too low</div>
-                        <div className="text-xs opacity-75">The monthly Amount must exceed the interest charge to pay this off.</div>
+                        <div className="text-xs opacity-75">Each payment must exceed the interest charge to pay this off.</div>
                       </div>
                     ) : (
-                      <div className="flex justify-between items-center">
-                        <div>
-                          <div className="text-xs text-purple-400 uppercase">Payoff Time</div>
-                          <div className="font-mono text-xl font-bold text-purple-300">{payoffCalc.months} mo</div>
-                          <div className="text-xs text-purple-400/70">({Math.floor(payoffCalc.months / 12)}y {payoffCalc.months % 12}m)</div>
+                      <>
+                        <div className="flex justify-between items-center">
+                          <div>
+                            <div className="text-xs text-purple-400 uppercase">Payoff Time</div>
+                            <div className="font-mono text-xl font-bold text-purple-300">{payoffCalc.months} mo</div>
+                            <div className="text-xs text-purple-400/70">({Math.floor(payoffCalc.months / 12)}y {payoffCalc.months % 12}m)</div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs text-purple-400 uppercase">Total Cost</div>
+                            <div className="font-mono text-lg font-semibold text-purple-300">{formatCurrency(payoffCalc.totalPaid)}</div>
+                            {payoffCalc.totalInterest > 0 && (
+                              <div className="text-xs text-purple-400/70">incl. {formatCurrency(payoffCalc.totalInterest)} interest</div>
+                            )}
+                          </div>
                         </div>
-                        <div className="text-right">
-                          <div className="text-xs text-purple-400 uppercase">Total Cost</div>
-                          <div className="font-mono text-lg font-semibold text-purple-300">{formatCurrency(payoffCalc.totalPaid)}</div>
-                          {payoffCalc.totalInterest > 0 && (
-                            <div className="text-xs text-purple-400/70">incl. {formatCurrency(payoffCalc.totalInterest)} interest</div>
-                          )}
+                        <div className="text-xs text-purple-400/50 mt-2">
+                          {payoffCalc.periods} payments ({paymentCadenceLabel(form.frequency)}), last one {formatCurrency(payoffCalc.lastPayment)}. Payments stop when the balance reaches $0.
                         </div>
-                      </div>
+                      </>
                     )}
                   </div>
                 )}
               </div>
             )}
-          </div>
-        )}
+        </div>
       </div>
       <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
         <button type="button" onClick={onClose} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Cancel</button>
         <button 
           type="button" 
           onClick={handleSave} 
-          disabled={!form.name || !form.amount || endBeforeStart || (form.frequency === 'split' && second < 0) || (trackBalance && form.frequency === 'monthly' && (!currentBalance || (payoffCalc?.months ?? 0) <= 0))}
+          disabled={!form.name || !form.amount || endBeforeStart || (form.frequency === 'split' && second < 0) || (trackBalance && (!currentBalance || (payoffCalc?.months ?? 0) <= 0))}
           className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium disabled:opacity-50"
         >
           Save
