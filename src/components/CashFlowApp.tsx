@@ -3,7 +3,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
-import { CashFlowData, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
+import { CashFlowData, CreditCard, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
 import { getPeriodRate } from '@/lib/payoff';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
@@ -15,6 +15,7 @@ import OneTimeExpenseForm from './forms/OneTimeExpenseForm';
 import CreditCardForm from './forms/CreditCardForm';
 import PaymentPlanForm from './forms/PaymentPlanForm';
 import InstanceEditForm from './forms/InstanceEditForm';
+import BalanceUpdateForm from './forms/BalanceUpdateForm';
 
 const defaultData: CashFlowData = { 
   startingBalance: 0, 
@@ -848,8 +849,14 @@ const getProjectionChanges = (before: Income | Expense, after: ItemDraft): strin
     changes.push(`starts ${new Date(afterStart + 'T12:00:00').toLocaleDateString()} instead of ${beforeStart ? new Date(beforeStart + 'T12:00:00').toLocaleDateString() : '—'}`);
   }
   if (JSON.stringify((before as Expense).splitConfig) !== JSON.stringify(after.splitConfig)) changes.push('split amounts changed');
-  if (JSON.stringify((before as Expense).creditCard) !== JSON.stringify(after.creditCard)) changes.push('balance tracking changed');
   if (JSON.stringify((before as Expense).paymentPlan) !== JSON.stringify(after.paymentPlan)) changes.push('payment plan changed');
+  // Deliberately not compared: `creditCard`. A balance is a fact re-measured over
+  // time — new charges land on the card, so it moves for reasons the schedule
+  // knows nothing about. buildBalanceSchedule already leaves every occurrence on
+  // or before balanceAsOfDate untouched, so re-recording a balance can't rewrite
+  // history and must never fork a new version (that's what produced duplicate
+  // monthly payments). The payment amount still supersedes — that one is a
+  // schedule change.
   return changes;
 };
 
@@ -904,6 +911,9 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const [scenarioName, setScenarioName] = useState('');
   const [renamingScenario, setRenamingScenario] = useState(false);
   const [expandedSeries, setExpandedSeries] = useState<string[]>([]);
+  // Promoting a sandbox change into Reality is hard to undo, and the changes list
+  // is scrolled by swiping right over the buttons — so it always confirms first.
+  const [confirmPromote, setConfirmPromote] = useState<ScenarioChange | null>(null);
   const [pendingChange, setPendingChange] = useState<
     | { type: 'income'; id: string; name: string; data: Omit<Income, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
     | { type: 'expense'; id: string; name: string; data: Omit<Expense, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
@@ -1114,6 +1124,28 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       const next = promoteInto(data.expenses, activeScenario.expenses.find(e => e.id === change.id), change);
       if (next) updateData({ expenses: next });
     }
+  };
+
+  // What "Make real" will actually do — spelled out before it happens, since
+  // promoting supersedes or stops items in Reality rather than just copying them.
+  const describePromotion = (change: ScenarioChange): string => {
+    if (change.kind === 'added') return `Adds ${change.name} to Reality.`;
+    if (change.kind === 'removed') return `Stops ${change.name} in Reality from today. Its history stays visible.`;
+
+    const original: Income | Expense | undefined = change.type === 'income'
+      ? data.incomes.find(i => i.id === change.id)
+      : data.expenses.find(e => e.id === change.id);
+    const source: Income | Expense | undefined = change.type === 'income'
+      ? activeScenario?.incomes.find(i => i.id === change.id)
+      : activeScenario?.expenses.find(e => e.id === change.id);
+    const prep = original && source ? prepareEdit(original, source) : null;
+
+    if (prep) {
+      return `Applies to ${change.name} in Reality from `
+        + `${new Date(prep.effectiveFrom + 'T12:00:00').toLocaleDateString()}. `
+        + 'Everything before that date stays exactly as it was.';
+    }
+    return `Updates ${change.name} in Reality.`;
   };
 
   const addIncome = (income: Omit<Income, 'id'>) => { updateBudget({ incomes: [...budget.incomes, { ...income, id: Date.now().toString() }] }); setModal(null); };
@@ -1878,6 +1910,37 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       monthsRemaining,
       payoffDate: payoff.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
     };
+  };
+
+  // What the projection expects a tracked balance to be on a given date. Used to
+  // show the gap when a real balance is re-recorded — that gap is the charges (or
+  // extra payments) the projection never knew about.
+  const getProjectedBalanceOnDate = (expense: Expense, dateStr: string): number => {
+    const cc = expense.creditCard;
+    if (!cc) return 0;
+    const schedule = getBalanceSchedule(expense);
+    // Before the current anchor there's nothing projected yet — the recorded
+    // balance is all we know.
+    if (dateStr <= (cc.balanceAsOfDate || '')) return schedule.startBalance;
+
+    const date = parseDate(dateStr);
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    // Balance carried into this month, then walk the month's own payments up to
+    // the date, matching how buildBalanceSchedule amortizes each period.
+    const prev = month === 0 ? { year: year - 1, month: 11 } : { year, month: month - 1 };
+    let balance = getRemainingBalanceAtMonth(expense, prev.year, prev.month);
+    const periodRate = getPeriodRate(cc.apr || 0, expense.frequency);
+
+    getOccurrencesInMonth(expense, year, month)
+      .filter(occ => occ.dateStr <= dateStr && occ.dateStr > (cc.balanceAsOfDate || ''))
+      .forEach(occ => {
+        if (balance <= 0.005) return;
+        balance += balance * periodRate;
+        balance = Math.max(0, balance - (occ.isSkipped ? 0 : occ.amount));
+      });
+
+    return balance;
   };
 
   const handleEditEvent = (event: DayEvent) => {
@@ -2720,7 +2783,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                     <span className="text-xs text-green-300">Balance cleared — adjust or remove this expense?</span>
                                     <div className="flex gap-2">
                                       <button
-                                        onClick={openEditor}
+                                        onClick={() => { setEditingItem(expense); setModal('update-balance'); }}
                                         className="px-2.5 py-1 bg-green-600/20 hover:bg-green-600/30 text-green-300 border border-green-500/30 rounded text-xs font-medium"
                                       >
                                         Adjust balance
@@ -2738,6 +2801,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                               <div className="flex items-center justify-between sm:justify-end gap-2">
                                 <div className={`font-mono font-semibold text-lg ${isPaidOff ? 'text-green-400' : catColor.text}`}>{formatCurrency(expense.amount)}/mo</div>
                                 <div className="flex gap-2">
+                                  {expense.creditCard && (
+                                    <button
+                                      onClick={() => { setEditingItem(expense); setModal('update-balance'); }}
+                                      className="px-3 py-1.5 bg-purple-500/15 text-purple-300 rounded text-sm whitespace-nowrap"
+                                      title="Record the current balance without changing the payment schedule"
+                                    >
+                                      Balance
+                                    </button>
+                                  )}
                                   <button onClick={openEditor} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
                                   <button onClick={() => requestDeleteExpense(expense)} className="px-3 py-1.5 bg-red-500/10 text-red-400 rounded">×</button>
                                 </div>
@@ -3061,6 +3133,17 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
           />
         </Modal>
       )}
+      {/* Re-record a real balance. Applies in place — never forks a new version. */}
+      {modal === 'update-balance' && editingItem && (editingItem as Expense).creditCard && (
+        <Modal title={`Update ${editingItem.name} Balance`} onClose={() => { setModal(null); setEditingItem(null); }}>
+          <BalanceUpdateForm
+            expense={editingItem as Expense}
+            projectedBalance={(asOfDate) => getProjectedBalanceOnDate(editingItem as Expense, asOfDate)}
+            onSave={(creditCard: CreditCard) => updateExpense(editingItem.id, { creditCard })}
+            onClose={() => { setModal(null); setEditingItem(null); }}
+          />
+        </Modal>
+      )}
       {modal === 'instance-edit' && editingEvent && editingItem && (
         <Modal title={`Edit ${editingEvent.name}`} onClose={() => { setModal(null); setEditingItem(null); setEditingEvent(null); }}>
           <InstanceEditForm
@@ -3206,7 +3289,7 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
                     <div className="text-xs text-gray-400 ml-5">{change.details.join(' • ')}</div>
                   </div>
                   <button
-                    onClick={() => promoteChange(change)}
+                    onClick={() => setConfirmPromote(change)}
                     className="px-3 py-1.5 bg-green-600/20 hover:bg-green-600/30 text-green-300 border border-green-500/30 rounded text-xs font-medium whitespace-nowrap"
                   >
                     Make real
@@ -3218,6 +3301,49 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
           <div className="flex justify-between items-center gap-3 p-4 border-t border-gray-800">
             <div className="text-xs text-gray-500">&quot;Make real&quot; applies one change to Reality and leaves the sandbox as-is.</div>
             <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Confirm before anything from the sandbox lands in Reality. Renders over
+          the changes list, which stays open behind it. */}
+      {confirmPromote && activeScenario && (
+        <Modal title="Make this real?" onClose={() => setConfirmPromote(null)}>
+          <div className="p-4 space-y-4">
+            <div className="p-3 bg-gray-800 rounded-lg">
+              <div className="flex items-center gap-2">
+                <span className={`font-mono text-sm ${confirmPromote.kind === 'added' ? 'text-green-400' : confirmPromote.kind === 'removed' ? 'text-red-400' : 'text-yellow-400'}`}>
+                  {confirmPromote.kind === 'added' ? '+' : confirmPromote.kind === 'removed' ? '−' : '~'}
+                </span>
+                <span className="font-medium truncate">{confirmPromote.name}</span>
+                <span className="text-xs text-gray-500 uppercase">{confirmPromote.type}</span>
+              </div>
+              <div className="text-xs text-gray-400 ml-5 mt-0.5">{confirmPromote.details.join(' • ')}</div>
+            </div>
+
+            <div className="text-sm text-gray-300">{describePromotion(confirmPromote)}</div>
+
+            <div className="text-xs text-gray-500">
+              This leaves {activeScenario.name} untouched, but it changes your real budget —
+              there&apos;s no undo.
+            </div>
+          </div>
+
+          <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-3 p-4 border-t border-gray-800">
+            <button
+              type="button"
+              onClick={() => setConfirmPromote(null)}
+              className="px-4 py-2 bg-gray-800 text-white rounded-lg"
+            >
+              No, keep it in the sandbox
+            </button>
+            <button
+              type="button"
+              onClick={() => { promoteChange(confirmPromote); setConfirmPromote(null); }}
+              className="px-4 py-2 bg-green-600 text-white rounded-lg font-medium"
+            >
+              Yes, make it real
+            </button>
           </div>
         </Modal>
       )}
