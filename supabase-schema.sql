@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS cashflow_data (
   incomes JSONB DEFAULT '[]'::jsonb,
   expenses JSONB DEFAULT '[]'::jsonb,
   category_colors JSONB DEFAULT '{}'::jsonb,
+  checkpoints JSONB DEFAULT '[]'::jsonb,
+  scenarios JSONB DEFAULT '[]'::jsonb,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   UNIQUE(user_id)
@@ -40,3 +42,9 @@ CREATE INDEX IF NOT EXISTS idx_cashflow_data_user_id ON cashflow_data(user_id);
 
 -- Migration to add category_colors:
 -- ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS category_colors JSONB DEFAULT '{}'::jsonb;
+
+-- Migration to add balance checkpoints (projected vs. actual reconciliation):
+ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS checkpoints JSONB DEFAULT '[]'::jsonb;
+
+-- Migration to add scenarios (sandbox forks of the budget):
+ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb;

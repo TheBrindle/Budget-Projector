@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
 import { CashFlowData, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
+import { getPeriodRate } from '@/lib/payoff';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
 import OneTimeIncomeForm from './forms/OneTimeIncomeForm';
@@ -223,133 +224,8 @@ const formatDateStr = (date: Date): string => {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 };
 
-// Calculate credit card remaining balance at a specific year/month
-// Returns { remainingBalance, isPaidOff, paymentThisMonth }
-const getCreditCardBalanceAtMonth = (
-  expense: Expense,
-  targetYear: number,
-  targetMonth: number
-): { remainingBalance: number; isPaidOff: boolean; paymentThisMonth: number } => {
-  if (!expense.creditCard) {
-    return { remainingBalance: 0, isPaidOff: true, paymentThisMonth: 0 };
-  }
-
-  const cc = expense.creditCard;
-  const apr = cc.apr || 0;
-  const monthlyRate = (apr / 100) / 12;
-  const regularPayment = expense.amount;
-  
-  // Use balanceAsOfDate if available, otherwise use today's date
-  // This handles migration from old data that only had totalDebt
-  const today = new Date();
-  const balanceDate = cc.balanceAsOfDate 
-    ? parseDate(cc.balanceAsOfDate)
-    : new Date(today.getFullYear(), today.getMonth(), 1); // First of current month
-  const balanceYear = balanceDate.getFullYear();
-  const balanceMonth = balanceDate.getMonth();
-  
-  // Start date for payments (when payments begin)
-  const startDate = parseDate(expense.startDate || new Date().toISOString().split('T')[0]);
-  const startYear = startDate.getFullYear();
-  const startMonth = startDate.getMonth();
-  const paymentDay = startDate.getDate();
-  
-  const overrides = expense.overrides || [];
-
-  // Use currentBalance if available, otherwise fall back to totalDebt
-  let balance = cc.currentBalance ?? cc.totalDebt;
-  
-  // If target is before the balance date, return the balance as-is
-  if (targetYear < balanceYear || (targetYear === balanceYear && targetMonth < balanceMonth)) {
-    return { remainingBalance: balance, isPaidOff: false, paymentThisMonth: 0 };
-  }
-  
-  // Start processing from the month AFTER the balance date
-  // (the balance is already the end-of-month balance for balanceMonth)
-  let currentYear = balanceYear;
-  let currentMonth = balanceMonth + 1;
-  if (currentMonth > 11) {
-    currentMonth = 0;
-    currentYear++;
-  }
-
-  // Process each month from after balance date until target month
-  while (currentYear < targetYear || (currentYear === targetYear && currentMonth < targetMonth)) {
-    if (balance <= 0) break;
-
-    // Only add interest and subtract payments if we're at or after the first payment month
-    const isPaymentMonth = (currentYear > startYear) || 
-      (currentYear === startYear && currentMonth >= startMonth);
-    
-    if (isPaymentMonth) {
-      // Add interest for this month
-      balance += balance * monthlyRate;
-
-      // Get payment for this month
-      const monthStr = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}`;
-      let payment = regularPayment;
-
-      // Check for override
-      const expectedDateStr = `${monthStr}-${String(Math.min(paymentDay, getDaysInMonth(currentYear, currentMonth))).padStart(2, '0')}`;
-      const override = overrides.find(o => o.originalDate === expectedDateStr);
-      
-      if (override) {
-        if (!isSkippedOverride(override) && override.newDate) {
-          const movedDate = parseDate(override.newDate);
-          if (movedDate.getFullYear() < targetYear || 
-              (movedDate.getFullYear() === targetYear && movedDate.getMonth() < targetMonth)) {
-            payment = override.newAmount ?? regularPayment;
-          } else {
-            payment = 0;
-          }
-        } else {
-          payment = 0;
-        }
-      }
-
-      balance -= payment;
-      if (balance < 0) balance = 0;
-    }
-
-    // Move to next month
-    currentMonth++;
-    if (currentMonth > 11) {
-      currentMonth = 0;
-      currentYear++;
-    }
-  }
-
-  // Calculate payment for the target month
-  let paymentThisMonth = 0;
-  if (balance > 0) {
-    const isPaymentMonth = (targetYear > startYear) || 
-      (targetYear === startYear && targetMonth >= startMonth);
-    
-    if (isPaymentMonth) {
-      // Add interest for target month
-      const interestThisMonth = balance * monthlyRate;
-      balance += interestThisMonth;
-      
-      const monthStr = `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}`;
-      const expectedDateStr = `${monthStr}-${String(Math.min(paymentDay, getDaysInMonth(targetYear, targetMonth))).padStart(2, '0')}`;
-      const override = overrides.find(o => o.originalDate === expectedDateStr);
-      
-      if (override && isSkippedOverride(override)) {
-        paymentThisMonth = 0;
-      } else if (override?.newAmount !== undefined) {
-        paymentThisMonth = Math.min(override.newAmount, balance);
-      } else {
-        paymentThisMonth = Math.min(regularPayment, balance);
-      }
-    }
-  }
-
-  return {
-    remainingBalance: Math.max(0, balance),
-    isPaidOff: balance <= 0,
-    paymentThisMonth
-  };
-};
+// 'YYYY-MM' key for a year/month pair. Zero-padded so keys sort as strings.
+const monthKey = (year: number, month: number) => `${year}-${String(month + 1).padStart(2, '0')}`;
 
 interface OccurrenceInfo {
   day: number;
@@ -362,10 +238,14 @@ interface OccurrenceInfo {
   originalDate?: string;
 }
 
-const getOccurrencesInMonth = (item: Income | Expense, year: number, month: number): OccurrenceInfo[] => {
+// The schedule an item would follow on its own, before any balance/payoff
+// tracking is applied. Handles frequency, overrides, splits and endDate.
+const getRawOccurrencesInMonth = (item: Income | Expense, year: number, month: number): OccurrenceInfo[] => {
   const occurrences: OccurrenceInfo[] = [];
   const monthStart = new Date(year, month, 1);
-  const monthEnd = new Date(year, month + 1, 0);
+  // End of the last day: occurrence dates are parsed at noon, so a midnight
+  // monthEnd would drop anything landing on the final day of the month.
+  const monthEnd = new Date(year, month + 1, 0, 23, 59, 59);
   const overrides = item.overrides || [];
 
   // Drop any occurrences past endDate (inclusive), then dedupe + sort.
@@ -542,62 +422,6 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
 
   const start = parseDate(item.startDate || item.date!);
   const expense = item as Expense;
-  
-  // Special handling for credit cards - calculate remaining balance and adjust payment
-  if (expense.creditCard) {
-    const dayOfMonth = Math.min(start.getDate(), getDaysInMonth(year, month));
-    const dateStr = formatDateStr(new Date(year, month, dayOfMonth));
-    const override = overrides.find(o => o.originalDate === dateStr);
-    
-    // Check for skipped first - show even if otherwise paid off
-    if (override && isSkippedOverride(override)) {
-      // Skipped - show with $0
-      occurrences.push({
-        day: dayOfMonth,
-        dateStr,
-        amount: 0,
-        isOverride: true,
-        isSkipped: true,
-        originalDate: dateStr
-      });
-      return finalize(occurrences);
-    }
-
-    const ccStatus = getCreditCardBalanceAtMonth(expense, year, month);
-
-    // If paid off, no occurrence
-    if (ccStatus.isPaidOff || ccStatus.paymentThisMonth <= 0) {
-      return finalize(occurrences);
-    }
-
-    // Check if we're before the start date
-    const monthsFromStart = (year - start.getFullYear()) * 12 + (month - start.getMonth());
-    if (monthsFromStart < 0) {
-      return finalize(occurrences);
-    }
-    
-    if (override && override.newDate) {
-      const newDate = parseDate(override.newDate);
-      if (newDate.getFullYear() === year && newDate.getMonth() === month) {
-        occurrences.push({
-          day: newDate.getDate(),
-          dateStr: override.newDate,
-          amount: override.newAmount ?? ccStatus.paymentThisMonth,
-          isOverride: true,
-          originalDate: dateStr
-        });
-      }
-    } else if (!override) {
-      occurrences.push({
-        day: dayOfMonth,
-        dateStr,
-        amount: ccStatus.paymentThisMonth,
-        isOverride: false
-      });
-    }
-
-    return finalize(occurrences);
-  }
 
   // Handle split frequency separately (not part of payment plan frequencies)
   if (item.frequency === 'split') {
@@ -780,7 +604,279 @@ const getOccurrencesInMonth = (item: Income | Expense, year: number, month: numb
   return finalize(occurrences);
 };
 
-interface CashFlowAppProps { 
+// ---------------------------------------------------------------------------
+// Balance / payoff tracking
+//
+// Any expense can carry a `creditCard` block (balance + as-of date + APR). The
+// schedule below amortizes that balance across the expense's own occurrences —
+// whatever its frequency — so interest accrues each payment period, the final
+// payment shrinks to whatever is left, and payments stop once it hits $0.
+// ---------------------------------------------------------------------------
+
+interface BalanceSchedule {
+  // 'YYYY-MM' -> amount actually paid for each raw occurrence that month.
+  // null means the occurrence falls after payoff and should be dropped.
+  months: Map<string, (number | null)[]>;
+  // 'YYYY-MM' -> balance remaining at the end of that month
+  endBalances: Map<string, number>;
+  firstMonth: string; // month containing balanceAsOfDate; nothing before it is touched
+  startBalance: number;
+  paidOffDate: string | null; // date of the payment that cleared the balance
+  neverPaysOff: boolean; // payments never exceed the interest charge
+}
+
+const MAX_SCHEDULE_MONTHS = 600; // 50 years — stops runaway projections
+
+// Schedules are keyed on the expense object itself. Expenses are replaced (never
+// mutated) on every edit, so a stale schedule can't outlive its expense.
+const scheduleCache = new WeakMap<Expense, BalanceSchedule>();
+
+const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
+  const cc = expense.creditCard!;
+  const asOf = cc.balanceAsOfDate || formatDateStr(new Date());
+  const periodRate = getPeriodRate(cc.apr || 0, expense.frequency);
+  const startBalance = Math.max(0, cc.currentBalance ?? cc.totalDebt ?? 0);
+
+  const months = new Map<string, (number | null)[]>();
+  const endBalances = new Map<string, number>();
+
+  const asOfDate = parseDate(asOf);
+  let year = asOfDate.getFullYear();
+  let month = asOfDate.getMonth();
+  const firstMonth = monthKey(year, month);
+
+  let balance = startBalance;
+  let paidOffDate: string | null = null;
+  let processed = 0;
+
+  while (processed < MAX_SCHEDULE_MONTHS) {
+    const key = monthKey(year, month);
+    const raw = getRawOccurrencesInMonth(expense, year, month);
+
+    const adjusted = raw.map(occ => {
+      // On or before the as-of date this is history — the balance the user
+      // recorded already reflects it, so leave the amount untouched.
+      if (occ.dateStr <= asOf) return occ.amount;
+      if (balance <= 0.005) return null; // paid off before this payment came due
+
+      // Interest accrues even when a payment is skipped.
+      balance += balance * periodRate;
+      const payment = occ.isSkipped ? 0 : Math.min(occ.amount, balance);
+      balance -= payment;
+      if (balance <= 0.005) {
+        balance = 0;
+        paidOffDate = occ.dateStr;
+      }
+      return payment;
+    });
+
+    months.set(key, adjusted);
+    endBalances.set(key, balance);
+    processed++;
+
+    if (balance <= 0.005) break;
+    // Nothing left to project once the series has ended.
+    if (expense.endDate && monthKey(year, month) >= expense.endDate.substring(0, 7)) break;
+
+    month++;
+    if (month > 11) { month = 0; year++; }
+  }
+
+  return {
+    months,
+    endBalances,
+    firstMonth,
+    startBalance,
+    paidOffDate,
+    neverPaysOff: balance > 0.005,
+  };
+};
+
+const getBalanceSchedule = (expense: Expense): BalanceSchedule => {
+  let schedule = scheduleCache.get(expense);
+  if (!schedule) {
+    schedule = buildBalanceSchedule(expense);
+    scheduleCache.set(expense, schedule);
+  }
+  return schedule;
+};
+
+// Occurrences are asked for repeatedly — once per day of the month per item, and
+// again for every month between the anchor and the view. Cache per item object;
+// items are replaced (never mutated) on edit, so entries can't go stale.
+const occurrenceCache = new WeakMap<Income | Expense, Map<string, OccurrenceInfo[]>>();
+
+const getOccurrencesInMonth = (item: Income | Expense, year: number, month: number): OccurrenceInfo[] => {
+  const key = monthKey(year, month);
+  let perItem = occurrenceCache.get(item);
+  if (!perItem) {
+    perItem = new Map();
+    occurrenceCache.set(item, perItem);
+  }
+  const hit = perItem.get(key);
+  if (hit) return hit;
+  const computed = computeOccurrencesInMonth(item, year, month);
+  perItem.set(key, computed);
+  return computed;
+};
+
+const computeOccurrencesInMonth = (item: Income | Expense, year: number, month: number): OccurrenceInfo[] => {
+  const raw = getRawOccurrencesInMonth(item, year, month);
+  const expense = item as Expense;
+  if (!expense.creditCard || raw.length === 0) return raw;
+
+  const schedule = getBalanceSchedule(expense);
+  const key = monthKey(year, month);
+
+  // Before the balance was recorded these are historical payments — show them
+  // as they were, so converting an existing expense never erases its history.
+  if (key < schedule.firstMonth) return raw;
+
+  const adjusted = schedule.months.get(key);
+  // Past the end of the schedule: everything after payoff is gone; if the
+  // balance never clears, payments simply continue.
+  if (!adjusted) return schedule.paidOffDate ? [] : raw;
+
+  const result: OccurrenceInfo[] = [];
+  raw.forEach((occ, i) => {
+    const amount = adjusted[i];
+    if (amount === null || amount === undefined) return;
+    result.push(amount === occ.amount ? occ : { ...occ, amount });
+  });
+  return result;
+};
+
+// Overrides are matched by the date an instance would naturally fall on. When the
+// schedule moves — a new start date, a new frequency — an override can stop
+// lining up with any real occurrence. That's not just dead data: one that moved
+// an instance into another month keeps injecting a phantom payment there while
+// the original instance quietly reappears. Drop the ones that no longer match.
+const pruneOrphanedOverrides = <T extends Income | Expense>(item: T): T => {
+  const overrides = item.overrides;
+  if (!overrides || overrides.length === 0) return item;
+
+  const withoutOverrides = { ...item, overrides: undefined } as T;
+  const kept = overrides.filter(override => {
+    const date = parseDate(override.originalDate);
+    return getRawOccurrencesInMonth(withoutOverrides, date.getFullYear(), date.getMonth())
+      .some(occ => occ.dateStr === override.originalDate);
+  });
+
+  return kept.length === overrides.length ? item : ({ ...item, overrides: kept } as T);
+};
+
+// Balance remaining at the end of the given month.
+const getRemainingBalanceAtMonth = (expense: Expense, year: number, month: number): number => {
+  if (!expense.creditCard) return 0;
+  const schedule = getBalanceSchedule(expense);
+  const key = monthKey(year, month);
+  if (key < schedule.firstMonth) return schedule.startBalance;
+  const end = schedule.endBalances.get(key);
+  if (end !== undefined) return Math.max(0, end);
+  // Past the schedule horizon.
+  return schedule.paidOffDate ? 0 : schedule.startBalance;
+};
+
+interface MonthProjection {
+  year: number;
+  month: number;
+  monthEnd: number;
+  lowest: number;
+  lowestDay: number;
+  income: number;
+  expenses: number;
+}
+
+// One difference between a scenario and Reality
+interface ScenarioChange {
+  key: string;
+  kind: 'added' | 'removed' | 'changed';
+  type: 'income' | 'expense';
+  id: string;
+  name: string;
+  details: string[];
+}
+
+// Human-readable summary of what changed on an item
+const describeItemChange = (before: Income | Expense, after: Income | Expense): string[] => {
+  const details: string[] = [];
+  if (before.name !== after.name) details.push(`renamed from "${before.name}"`);
+  if (before.amount !== after.amount) details.push(`${formatCurrency(before.amount)} → ${formatCurrency(after.amount)}`);
+  if (before.frequency !== after.frequency) details.push(`${frequencyLabels[before.frequency]} → ${frequencyLabels[after.frequency]}`);
+  if ((before.startDate || before.date) !== (after.startDate || after.date)) {
+    details.push(`starts ${after.startDate || after.date}`);
+  }
+  if (before.endDate !== after.endDate) {
+    details.push(after.endDate ? `ends ${after.endDate}` : 'end date removed');
+  }
+  const beforeCategory = (before as Expense).category;
+  const afterCategory = (after as Expense).category;
+  if (beforeCategory !== afterCategory) details.push(`category → ${afterCategory}`);
+  if (JSON.stringify((before as Expense).creditCard) !== JSON.stringify((after as Expense).creditCard)) {
+    details.push((after as Expense).creditCard ? 'balance tracking changed' : 'balance tracking removed');
+  }
+  if (details.length === 0) details.push('modified');
+  return details;
+};
+
+// What a form hands back — loose enough to describe either an income or an
+// expense without collapsing their differing frequency unions.
+interface ItemDraft {
+  amount?: number;
+  frequency?: string;
+  startDate?: string;
+  date?: string;
+  endDate?: string;
+  splitConfig?: unknown;
+  creditCard?: unknown;
+  paymentPlan?: unknown;
+}
+
+// Fields that change what the projection draws. Renaming or recategorizing is
+// harmless to apply retroactively; these rewrite history.
+const getProjectionChanges = (before: Income | Expense, after: ItemDraft): string[] => {
+  const changes: string[] = [];
+  if (after.amount !== undefined && before.amount !== after.amount) {
+    changes.push(`${formatCurrency(before.amount)} → ${formatCurrency(after.amount)}`);
+  }
+  if (after.frequency && before.frequency !== after.frequency) {
+    changes.push(`${frequencyLabels[before.frequency]} → ${frequencyLabels[after.frequency]}`);
+  }
+  const beforeStart = before.startDate || before.date;
+  const afterStart = after.startDate || after.date;
+  if (afterStart && beforeStart !== afterStart) {
+    changes.push(`starts ${new Date(afterStart + 'T12:00:00').toLocaleDateString()} instead of ${beforeStart ? new Date(beforeStart + 'T12:00:00').toLocaleDateString() : '—'}`);
+  }
+  if (JSON.stringify((before as Expense).splitConfig) !== JSON.stringify(after.splitConfig)) changes.push('split amounts changed');
+  if (JSON.stringify((before as Expense).creditCard) !== JSON.stringify(after.creditCard)) changes.push('balance tracking changed');
+  if (JSON.stringify((before as Expense).paymentPlan) !== JSON.stringify(after.paymentPlan)) changes.push('payment plan changed');
+  return changes;
+};
+
+// One real-world item and every version of it, oldest first
+interface ItemSeries<T> {
+  key: string;
+  current: T;
+  versions: T[];
+}
+
+const groupIntoSeries = <T extends Income | Expense>(items: T[]): ItemSeries<T>[] => {
+  const bySeries = new Map<string, T[]>();
+  items.forEach(item => {
+    const key = item.seriesId || item.id;
+    const list = bySeries.get(key);
+    if (list) list.push(item);
+    else bySeries.set(key, [item]);
+  });
+  return Array.from(bySeries.entries()).map(([key, versions]) => {
+    const sorted = [...versions].sort((a, b) =>
+      (a.startDate || a.date || '').localeCompare(b.startDate || b.date || '')
+    );
+    return { key, current: sorted[sorted.length - 1], versions: sorted };
+  });
+};
+
+interface CashFlowAppProps {
   user: User | null;
   onExitPreview?: () => void;
 }
@@ -803,6 +899,23 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const [oldMonthWarning, setOldMonthWarning] = useState<{ show: boolean; event: DayEvent | null; item: Income | Expense | null }>({ show: false, event: null, item: null });
   const [editingGigPayment, setEditingGigPayment] = useState<ScheduledPayment | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'income' | 'expense'; item: Income | Expense } | null>(null);
+  const [checkpointColumnMissing, setCheckpointColumnMissing] = useState(false);
+  const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null);
+  const [scenarioName, setScenarioName] = useState('');
+  const [renamingScenario, setRenamingScenario] = useState(false);
+  const [expandedSeries, setExpandedSeries] = useState<string[]>([]);
+  const [pendingChange, setPendingChange] = useState<
+    | { type: 'income'; id: string; name: string; data: Omit<Income, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
+    | { type: 'expense'; id: string; name: string; data: Omit<Expense, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
+    | null
+  >(null);
+  // formatDateStr is local-time; toISOString would hand back tomorrow's date
+  // for anyone east of UTC in the evening.
+  const [newCheckpoint, setNewCheckpoint] = useState(() => ({
+    date: formatDateStr(new Date()),
+    amount: '',
+    note: ''
+  }));
 
   const supabase = createClient();
 
@@ -835,7 +948,9 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
             floorThreshold: parseFloat(cashflowData.floor_threshold) || 50,
             incomes: incomes,
             expenses: expenses,
-            categoryColors: cashflowData.category_colors || {}
+            categoryColors: cashflowData.category_colors || {},
+            checkpoints: Array.isArray(cashflowData.checkpoints) ? cashflowData.checkpoints : [],
+            scenarios: Array.isArray(cashflowData.scenarios) ? cashflowData.scenarios : []
           });
         }
       } catch (err) {
@@ -858,20 +973,32 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         .single();
       
       const payload = {
-        starting_balance: newData.startingBalance, 
+        starting_balance: newData.startingBalance,
         starting_date: newData.startingDate,
-        warning_threshold: newData.warningThreshold, 
-        floor_threshold: newData.floorThreshold, 
-        incomes: newData.incomes, 
+        warning_threshold: newData.warningThreshold,
+        floor_threshold: newData.floorThreshold,
+        incomes: newData.incomes,
         expenses: newData.expenses,
-        category_colors: newData.categoryColors || {}
+        category_colors: newData.categoryColors || {},
+        checkpoints: newData.checkpoints || [],
+        scenarios: newData.scenarios || []
       };
-      
-      if (existingData) {
-        await supabase.from('cashflow_data').update(payload).eq('user_id', user!.id);
-      } else {
-        await supabase.from('cashflow_data').insert({ ...payload, user_id: user!.id });
+
+      const write = (body: Record<string, unknown>) => existingData
+        ? supabase.from('cashflow_data').update(body).eq('user_id', user!.id)
+        : supabase.from('cashflow_data').insert({ ...body, user_id: user!.id });
+
+      let { error } = await write(payload);
+
+      // These columns are newer than some databases. Rather than lose the whole
+      // save, drop whichever one is missing and tell the user to run the migration.
+      if (error && /checkpoints|scenarios/i.test(error.message || '')) {
+        const { checkpoints, scenarios, ...core } = payload;
+        ({ error } = await write(core));
+        setCheckpointColumnMissing(true);
       }
+
+      if (error) console.error('Error saving data:', error);
     } catch (err) {
       console.error('Error saving data:', err);
     }
@@ -880,12 +1007,137 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
   const updateData = (updates: Partial<CashFlowData>) => { const newData = { ...data, ...updates }; setData(newData); saveData(newData); };
 
-  const addIncome = (income: Omit<Income, 'id'>) => { updateData({ incomes: [...data.incomes, { ...income, id: Date.now().toString() }] }); setModal(null); };
-  const updateIncome = (id: string, updates: Partial<Income>) => { updateData({ incomes: data.incomes.map(i => i.id === id ? { ...i, ...updates } : i) }); setModal(null); setEditingItem(null); };
-  const deleteIncome = (id: string) => { updateData({ incomes: data.incomes.filter(i => i.id !== id) }); };
-  const addExpense = (expense: Omit<Expense, 'id'>) => { updateData({ expenses: [...data.expenses, { ...expense, id: Date.now().toString() }] }); setModal(null); };
-  const updateExpense = (id: string, updates: Partial<Expense>) => { updateData({ expenses: data.expenses.map(e => e.id === id ? { ...e, ...updates } : e) }); setModal(null); setEditingItem(null); };
-  const deleteExpense = (id: string) => { updateData({ expenses: data.expenses.filter(e => e.id !== id) }); };
+  // The budget currently on screen: Reality, or the scenario you're sandboxed in.
+  const activeScenario = (data.scenarios || []).find(s => s.id === activeScenarioId) || null;
+  const budget = activeScenario
+    ? { incomes: activeScenario.incomes, expenses: activeScenario.expenses }
+    : { incomes: data.incomes, expenses: data.expenses };
+
+  // Every income/expense edit lands on whichever budget is active, so editing
+  // inside a scenario can never touch Reality.
+  const updateBudget = (updates: { incomes?: Income[]; expenses?: Expense[] }) => {
+    if (activeScenarioId) {
+      updateData({ scenarios: (data.scenarios || []).map(s => s.id === activeScenarioId ? { ...s, ...updates } : s) });
+    } else {
+      updateData(updates);
+    }
+  };
+
+  // Fork the budget you're currently looking at into a new sandbox
+  const createScenario = (name: string) => {
+    const id = Date.now().toString();
+    const copy = <T,>(items: T[]): T[] => JSON.parse(JSON.stringify(items));
+    updateData({
+      scenarios: [...(data.scenarios || []), {
+        id,
+        name: name.trim() || 'Untitled scenario',
+        createdAt: formatDateStr(new Date()),
+        incomes: copy(budget.incomes),
+        expenses: copy(budget.expenses)
+      }]
+    });
+    setActiveScenarioId(id);
+    setModal(null);
+    setScenarioName('');
+  };
+
+  const deleteScenario = (id: string) => {
+    updateData({ scenarios: (data.scenarios || []).filter(s => s.id !== id) });
+    if (activeScenarioId === id) setActiveScenarioId(null);
+    setModal(null);
+  };
+
+  const renameScenario = (id: string, name: string) => {
+    updateData({ scenarios: (data.scenarios || []).map(s => s.id === id ? { ...s, name: name.trim() || s.name } : s) });
+    setRenamingScenario(false);
+  };
+
+  // What this scenario changed relative to Reality
+  const scenarioDiff = useMemo((): ScenarioChange[] => {
+    if (!activeScenario) return [];
+    const changes: ScenarioChange[] = [];
+
+    const compare = (type: 'income' | 'expense', realityItems: (Income | Expense)[], scenarioItems: (Income | Expense)[]) => {
+      const realityById = new Map(realityItems.map(i => [i.id, i]));
+      const scenarioById = new Map(scenarioItems.map(i => [i.id, i]));
+
+      scenarioItems.forEach(item => {
+        const original = realityById.get(item.id);
+        if (!original) {
+          changes.push({ key: `${type}:${item.id}`, kind: 'added', type, id: item.id, name: item.name, details: [`${formatCurrency(item.amount)} ${frequencyLabels[item.frequency] || ''}`] });
+        } else if (JSON.stringify(original) !== JSON.stringify(item)) {
+          changes.push({ key: `${type}:${item.id}`, kind: 'changed', type, id: item.id, name: item.name, details: describeItemChange(original, item) });
+        }
+      });
+
+      realityItems.forEach(item => {
+        if (!scenarioById.has(item.id)) {
+          changes.push({ key: `${type}:${item.id}`, kind: 'removed', type, id: item.id, name: item.name, details: [`was ${formatCurrency(item.amount)} ${frequencyLabels[item.frequency] || ''}`] });
+        }
+      });
+    };
+
+    compare('income', data.incomes, activeScenario.incomes);
+    compare('expense', data.expenses, activeScenario.expenses);
+    return changes;
+  }, [activeScenario, data.incomes, data.expenses]);
+
+  // Apply one scenario change to Reality. A change that would rewrite history
+  // supersedes instead, exactly like editing the item directly.
+  const promoteInto = <T extends Income | Expense>(
+    reality: T[],
+    source: T | undefined,
+    change: ScenarioChange
+  ): T[] | null => {
+    if (change.kind === 'removed') {
+      // Stop it going forward rather than deleting — deleting erases its history
+      return reality.map(i => i.id === change.id ? ({ ...i, endDate: todayStr() } as T) : i);
+    }
+    if (!source) return null;
+    const copy = pruneOrphanedOverrides(JSON.parse(JSON.stringify(source)) as T);
+    if (change.kind === 'added') return [...reality, copy];
+
+    const original = reality.find(i => i.id === change.id);
+    const prep = original ? prepareEdit(original, copy) : null;
+    if (original && prep) {
+      return supersedeInList(reality, change.id, copy, prep.effectiveFrom);
+    }
+    return reality.map(i => i.id === change.id ? copy : i);
+  };
+
+  const promoteChange = (change: ScenarioChange) => {
+    if (!activeScenario) return;
+    if (change.type === 'income') {
+      const next = promoteInto(data.incomes, activeScenario.incomes.find(i => i.id === change.id), change);
+      if (next) updateData({ incomes: next });
+    } else {
+      const next = promoteInto(data.expenses, activeScenario.expenses.find(e => e.id === change.id), change);
+      if (next) updateData({ expenses: next });
+    }
+  };
+
+  const addIncome = (income: Omit<Income, 'id'>) => { updateBudget({ incomes: [...budget.incomes, { ...income, id: Date.now().toString() }] }); setModal(null); };
+  const updateIncome = (id: string, updates: Partial<Income>) => { updateBudget({ incomes: budget.incomes.map(i => i.id === id ? pruneOrphanedOverrides({ ...i, ...updates }) : i) }); setModal(null); setEditingItem(null); };
+  const deleteIncome = (id: string) => { updateBudget({ incomes: budget.incomes.filter(i => i.id !== id) }); };
+  const addExpense = (expense: Omit<Expense, 'id'>) => { updateBudget({ expenses: [...budget.expenses, { ...expense, id: Date.now().toString() }] }); setModal(null); };
+  const updateExpense = (id: string, updates: Partial<Expense>) => { updateBudget({ expenses: budget.expenses.map(e => e.id === id ? pruneOrphanedOverrides({ ...e, ...updates }) : e) }); setModal(null); setEditingItem(null); };
+  const deleteExpense = (id: string) => { updateBudget({ expenses: budget.expenses.filter(e => e.id !== id) }); };
+
+  const addCheckpoint = () => {
+    const amount = parseFloat(newCheckpoint.amount);
+    if (!newCheckpoint.date || isNaN(amount)) return;
+    updateData({
+      checkpoints: [
+        ...(data.checkpoints || []).filter(c => c.date !== newCheckpoint.date),
+        { id: Date.now().toString(), date: newCheckpoint.date, actualBalance: amount, note: newCheckpoint.note || undefined }
+      ]
+    });
+    setNewCheckpoint({ date: formatDateStr(new Date()), amount: '', note: '' });
+  };
+
+  const deleteCheckpoint = (id: string) => {
+    updateData({ checkpoints: (data.checkpoints || []).filter(c => c.id !== id) });
+  };
 
   // Today as YYYY-MM-DD (local time)
   const todayStr = () => {
@@ -907,17 +1159,17 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
   // Stop the recurrence going forward without wiping history.
   const stopExpenseForward = (id: string) => {
-    updateData({ expenses: data.expenses.map(e => e.id === id ? { ...e, endDate: todayStr() } : e) });
+    updateBudget({ expenses: budget.expenses.map(e => e.id === id ? { ...e, endDate: todayStr() } : e) });
     setDeleteConfirm(null);
   };
   const stopIncomeForward = (id: string) => {
-    updateData({ incomes: data.incomes.map(i => i.id === id ? { ...i, endDate: todayStr() } : i) });
+    updateBudget({ incomes: budget.incomes.map(i => i.id === id ? { ...i, endDate: todayStr() } : i) });
     setDeleteConfirm(null);
   };
 
   // Gig income management functions
   const addGigPayment = (incomeId: string, payment: Omit<ScheduledPayment, 'id'>) => {
-    const income = data.incomes.find(i => i.id === incomeId);
+    const income = budget.incomes.find(i => i.id === incomeId);
     if (!income || income.frequency !== 'gig') return;
 
     const newPayment: ScheduledPayment = {
@@ -926,8 +1178,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     };
 
     const updatedPayments = [...(income.scheduledPayments || []), newPayment];
-    updateData({
-      incomes: data.incomes.map(i =>
+    updateBudget({
+      incomes: budget.incomes.map(i =>
         i.id === incomeId ? { ...i, scheduledPayments: updatedPayments } : i
       )
     });
@@ -937,15 +1189,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   };
 
   const updateGigPayment = (incomeId: string, paymentId: string, updates: Partial<ScheduledPayment>) => {
-    const income = data.incomes.find(i => i.id === incomeId);
+    const income = budget.incomes.find(i => i.id === incomeId);
     if (!income || income.frequency !== 'gig') return;
 
     const updatedPayments = (income.scheduledPayments || []).map(p =>
       p.id === paymentId ? { ...p, ...updates } : p
     );
 
-    updateData({
-      incomes: data.incomes.map(i =>
+    updateBudget({
+      incomes: budget.incomes.map(i =>
         i.id === incomeId ? { ...i, scheduledPayments: updatedPayments } : i
       )
     });
@@ -955,13 +1207,13 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   };
 
   const deleteGigPayment = (incomeId: string, paymentId: string) => {
-    const income = data.incomes.find(i => i.id === incomeId);
+    const income = budget.incomes.find(i => i.id === incomeId);
     if (!income || income.frequency !== 'gig') return;
 
     const updatedPayments = (income.scheduledPayments || []).filter(p => p.id !== paymentId);
 
-    updateData({
-      incomes: data.incomes.map(i =>
+    updateBudget({
+      incomes: budget.incomes.map(i =>
         i.id === incomeId ? { ...i, scheduledPayments: updatedPayments } : i
       )
     });
@@ -969,31 +1221,150 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
   // Helper to get gig income sources
   const gigIncomes = useMemo(() =>
-    data.incomes.filter(i => i.frequency === 'gig'),
-    [data.incomes]
+    budget.incomes.filter(i => i.frequency === 'gig'),
+    [budget.incomes]
   );
 
   // Helper to get regular (non-gig) income sources
   const regularIncomes = useMemo(() =>
-    data.incomes.filter(i => i.frequency !== 'gig'),
-    [data.incomes]
+    budget.incomes.filter(i => i.frequency !== 'gig'),
+    [budget.incomes]
   );
 
   // Type-safe save handlers for modals
-  const handleSaveIncome = (d: Omit<Income, 'id'>) => {
-    if (editingItem) {
-      updateIncome(editingItem.id, d);
-    } else {
-      addIncome(d);
+  // How many occurrences has this item already produced? Zero means editing it
+  // retroactively can't break anything, so we shouldn't ask.
+  const countPastOccurrences = (item: Income | Expense): number => {
+    const today = todayStr();
+    const startStr = item.startDate || item.date;
+    if (!startStr || startStr >= today) return 0;
+
+    const start = parseDate(startStr);
+    let year = start.getFullYear();
+    let month = start.getMonth();
+    const now = new Date();
+    let guard = 0;
+    let count = 0;
+
+    while ((year < now.getFullYear() || (year === now.getFullYear() && month <= now.getMonth())) && guard < 600) {
+      count += getOccurrencesInMonth(item, year, month).filter(o => o.dateStr < today).length;
+      if (count > 500) break; // enough to know it's "a lot"
+      month++;
+      if (month > 11) { month = 0; year++; }
+      guard++;
     }
+    return count;
   };
-  
-  const handleSaveExpense = (d: Omit<Expense, 'id'>) => {
-    if (editingItem) {
-      updateExpense(editingItem.id, d);
-    } else {
-      addExpense(d);
+
+  // First scheduled occurrence on or after a date — the natural point for a
+  // change to take effect, so a mid-cycle edit doesn't invent an extra payment.
+  const nextOccurrenceOnOrAfter = (item: Income | Expense, fromDateStr: string): string | null => {
+    const from = parseDate(fromDateStr);
+    let year = from.getFullYear();
+    let month = from.getMonth();
+    for (let i = 0; i < 24; i++) {
+      const hit = getOccurrencesInMonth(item, year, month).find(o => o.dateStr >= fromDateStr);
+      if (hit) return hit.dateStr;
+      month++;
+      if (month > 11) { month = 0; year++; }
     }
+    return null;
+  };
+
+  // Cap the old version the day before the change and start a new one, both
+  // tagged with the same seriesId so the list still shows a single item.
+  const supersedeInList = <T extends Income | Expense>(
+    items: T[],
+    id: string,
+    draft: Partial<T>,
+    effectiveFrom: string
+  ): T[] | null => {
+    const original = items.find(i => i.id === id);
+    if (!original) return null;
+
+    const seriesId = original.seriesId || original.id;
+    const lastDayOfOldVersion = formatDateStr(new Date(parseDate(effectiveFrom).getTime() - 86400000));
+    const draftEnd = (draft as Income).endDate;
+
+    const successor = {
+      ...(draft as object),
+      id: `${Date.now()}`,
+      seriesId,
+      startDate: effectiveFrom,
+      endDate: draftEnd && draftEnd < effectiveFrom ? undefined : draftEnd,
+      // Per-instance edits belong to the version that was running at the time
+      overrides: undefined
+    } as T;
+
+    // Insert the new version right after the old one so list and day-event
+    // ordering stay put instead of the item jumping to the bottom.
+    return items.flatMap(i => i.id === id
+      ? [pruneOrphanedOverrides({ ...i, seriesId, endDate: lastDayOfOldVersion } as T), successor]
+      : [i]);
+  };
+
+  // Would this edit rewrite history? If so, return what to ask the user.
+  const prepareEdit = (original: Income | Expense, d: ItemDraft) => {
+    // One-time and gig items have no recurring history to rewrite
+    if (original.frequency === 'once' || original.frequency === 'gig') return null;
+    const changes = getProjectionChanges(original, d);
+    if (changes.length === 0) return null;
+    const pastCount = countPastOccurrences(original);
+    if (pastCount === 0) return null;
+    return {
+      changes,
+      pastCount,
+      // Per-instance edits that won't survive a schedule change
+      orphanedOverrides: (original.overrides || []).length > 0 && !!d.startDate && d.startDate !== (original.startDate || original.date)
+        ? (original.overrides || []).length
+        : 0,
+      effectiveFrom: nextOccurrenceOnOrAfter(original, todayStr()) || todayStr()
+    };
+  };
+
+  const applyPendingChange = (mode: 'retroactive' | 'forward') => {
+    if (!pendingChange) return;
+
+    if (mode === 'retroactive') {
+      if (pendingChange.type === 'expense') updateExpense(pendingChange.id, pendingChange.data);
+      else updateIncome(pendingChange.id, pendingChange.data);
+    } else if (pendingChange.type === 'expense') {
+      const next = supersedeInList(budget.expenses, pendingChange.id, pendingChange.data, pendingChange.effectiveFrom);
+      if (next) updateBudget({ expenses: next });
+    } else {
+      const next = supersedeInList(budget.incomes, pendingChange.id, pendingChange.data, pendingChange.effectiveFrom);
+      if (next) updateBudget({ incomes: next });
+    }
+
+    setPendingChange(null);
+    setModal(null);
+    setEditingItem(null);
+  };
+
+  const handleSaveIncome = (d: Omit<Income, 'id'>) => {
+    if (!editingItem) { addIncome(d); return; }
+    const original = budget.incomes.find(i => i.id === editingItem.id);
+    const prep = original ? prepareEdit(original, d) : null;
+    if (original && prep) {
+      setPendingChange({ type: 'income', id: original.id, name: original.name, data: d, ...prep });
+      setEditingItem(null);
+      setModal('apply-change');
+      return;
+    }
+    updateIncome(editingItem.id, d);
+  };
+
+  const handleSaveExpense = (d: Omit<Expense, 'id'>) => {
+    if (!editingItem) { addExpense(d); return; }
+    const original = budget.expenses.find(e => e.id === editingItem.id);
+    const prep = original ? prepareEdit(original, d) : null;
+    if (original && prep) {
+      setPendingChange({ type: 'expense', id: original.id, name: original.name, data: d, ...prep });
+      setEditingItem(null);
+      setModal('apply-change');
+      return;
+    }
+    updateExpense(editingItem.id, d);
   };
 
   // Handle gig payment save
@@ -1010,8 +1381,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     if (!editingEvent || !editingItem) return;
     
     const currentItem = editingEvent.type === 'income'
-      ? data.incomes.find(i => i.id === editingItem.id)
-      : data.expenses.find(e => e.id === editingItem.id);
+      ? budget.incomes.find(i => i.id === editingItem.id)
+      : budget.expenses.find(e => e.id === editingItem.id);
     
     if (!currentItem) return;
     
@@ -1032,8 +1403,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     
     // Get fresh reference to the item from current data
     const currentItem = editingEvent.type === 'income'
-      ? data.incomes.find(i => i.id === editingItem.id)
-      : data.expenses.find(e => e.id === editingItem.id);
+      ? budget.incomes.find(i => i.id === editingItem.id)
+      : budget.expenses.find(e => e.id === editingItem.id);
     
     if (!currentItem) return;
     
@@ -1064,36 +1435,64 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     }
   };
 
+  // Every real balance the user has recorded, oldest first. The starting point in
+  // Settings is simply checkpoint zero.
+  const balanceAnchors = useMemo(() => {
+    const list = [{ date: data.startingDate, balance: data.startingBalance }];
+    (data.checkpoints || []).forEach(c => list.push({ date: c.date, balance: c.actualBalance }));
+    return list.sort((a, b) => a.date.localeCompare(b.date));
+  }, [data.startingDate, data.startingBalance, data.checkpoints]);
+
+  // The most recent real balance on or before a date. Projecting from here rather
+  // than from the original starting balance keeps the forecast tied to reality.
+  const anchorOnOrBefore = (dateStr: string, anchors = balanceAnchors) => {
+    let chosen = anchors[0];
+    for (const anchor of anchors) {
+      if (anchor.date <= dateStr) chosen = anchor;
+      else break;
+    }
+    return chosen;
+  };
+
+  // Checkpoint balances by date — a checkpoint resets the running balance at the
+  // start of its day, before that day's transactions.
+  const checkpointByDate = useMemo(() => {
+    const map = new Map<string, number>();
+    (data.checkpoints || []).forEach(c => map.set(c.date, c.actualBalance));
+    return map;
+  }, [data.checkpoints]);
+
   const dailyData: DayData[] = useMemo(() => {
     const { year, month } = selectedMonth;
     const days: DayData[] = [];
-    
-    // Parse starting date
-    const startDate = parseDate(data.startingDate);
+
+    // Anchor to the latest real balance recorded before this month begins
+    const anchor = anchorOnOrBefore(`${monthKey(year, month)}-01`);
+    const startDate = parseDate(anchor.date);
     const startYear = startDate.getFullYear();
     const startMonth = startDate.getMonth();
     const startDay = startDate.getDate();
-    
+
     // Calculate balance at the start of the selected month
-    // by processing all transactions from startingDate to end of previous month
-    let balanceAtMonthStart = data.startingBalance;
-    
-    // Process from starting date forward to the day before selected month
+    // by processing all transactions from the anchor to end of previous month
+    let balanceAtMonthStart = anchor.balance;
+
+    // Process from the anchor date forward to the day before selected month
     let tempYear = startYear;
     let tempMonth = startMonth;
-    
+
     while (tempYear < year || (tempYear === year && tempMonth < month)) {
       const daysInThisMonth = getDaysInMonth(tempYear, tempMonth);
       const dayStart = (tempYear === startYear && tempMonth === startMonth) ? startDay : 1;
       
       for (let d = dayStart; d <= daysInThisMonth; d++) {
-        data.incomes.forEach(income => {
+        budget.incomes.forEach(income => {
           const occurrences = getOccurrencesInMonth(income, tempYear, tempMonth);
           occurrences.filter(o => o.day === d).forEach(occ => {
             balanceAtMonthStart += occ.amount;
           });
         });
-        data.expenses.forEach(expense => {
+        budget.expenses.forEach(expense => {
           const occurrences = getOccurrencesInMonth(expense, tempYear, tempMonth);
           occurrences.filter(o => o.day === d).forEach(occ => {
             balanceAtMonthStart -= occ.amount;
@@ -1121,10 +1520,14 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     }
     
     for (let day = firstDayToProcess; day <= getDaysInMonth(year, month); day++) {
+      // A checkpoint recorded on this day snaps the projection back to reality
+      const checkpoint = checkpointByDate.get(`${monthKey(year, month)}-${String(day).padStart(2, '0')}`);
+      if (checkpoint !== undefined) runningBalance = checkpoint;
+
       let dayChange = 0;
       const events: DayEvent[] = [];
-      
-      data.incomes.forEach(income => {
+
+      budget.incomes.forEach(income => {
         const occurrences = getOccurrencesInMonth(income, year, month);
         // Use filter to get all occurrences on this day (supports splits)
         const dayOccurrences = occurrences.filter(o => o.day === day);
@@ -1144,7 +1547,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         });
       });
       
-      data.expenses.forEach(expense => {
+      budget.expenses.forEach(expense => {
         const occurrences = getOccurrencesInMonth(expense, year, month);
         // Use filter to get all occurrences on this day (supports splits)
         const dayOccurrences = occurrences.filter(o => o.day === day);
@@ -1166,6 +1569,14 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         });
       });
       
+      // Stamp each event with the balance right after it, so the list can show
+      // a running balance per transaction rather than one per day.
+      let afterEvent = runningBalance;
+      events.forEach(event => {
+        afterEvent += event.type === 'income' ? event.amount : -event.amount;
+        event.runningBalance = afterEvent;
+      });
+
       runningBalance += dayChange;
       days.push({ day, events, change: dayChange, balance: runningBalance });
     }
@@ -1179,20 +1590,21 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     return { lowestBalance: lowestDay?.balance ?? 0, lowestDay: lowestDay?.day ?? 1, endingBalance: dailyData[dailyData.length - 1]?.balance ?? data.startingBalance, totalIncome, totalExpenses, availableForVariable: totalIncome - totalExpenses };
   }, [dailyData, data]);
 
-  // Calculate today's balance from starting balance
+  // Today's balance, projected forward from the most recent real balance recorded
   const todaysBalance = useMemo(() => {
     const today = new Date();
     const todayYear = today.getFullYear();
     const todayMonth = today.getMonth();
     const todayDay = today.getDate();
-    
-    const startDate = parseDate(data.startingDate);
+
+    const anchor = anchorOnOrBefore(formatDateStr(today));
+    const startDate = parseDate(anchor.date);
     const startYear = startDate.getFullYear();
     const startMonth = startDate.getMonth();
     const startDay = startDate.getDate();
-    
-    let balance = data.startingBalance;
-    
+
+    let balance = anchor.balance;
+
     // Process from starting date to today
     let tempYear = startYear;
     let tempMonth = startMonth;
@@ -1203,13 +1615,13 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       const dayEnd = (tempYear === todayYear && tempMonth === todayMonth) ? todayDay : daysInThisMonth;
       
       for (let d = dayStart; d <= dayEnd; d++) {
-        data.incomes.forEach(income => {
+        budget.incomes.forEach(income => {
           const occurrences = getOccurrencesInMonth(income, tempYear, tempMonth);
           occurrences.filter(o => o.day === d).forEach(occ => {
             balance += occ.amount;
           });
         });
-        data.expenses.forEach(expense => {
+        budget.expenses.forEach(expense => {
           const occurrences = getOccurrencesInMonth(expense, tempYear, tempMonth);
           occurrences.filter(o => o.day === d).forEach(occ => {
             balance -= occ.amount;
@@ -1226,6 +1638,172 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     
     return balance;
   }, [data]);
+
+  // Balance the projection expects at the start of targetDate, running forward
+  // from a given anchor and ignoring anything recorded after it.
+  const projectBalanceAt = (anchor: { date: string; balance: number }, targetDateStr: string): number => {
+    const start = parseDate(anchor.date);
+    const target = parseDate(targetDateStr);
+    if (target <= start) return anchor.balance;
+
+    let balance = anchor.balance;
+    let year = start.getFullYear();
+    let month = start.getMonth();
+
+    while (year < target.getFullYear() || (year === target.getFullYear() && month <= target.getMonth())) {
+      const isFirstMonth = year === start.getFullYear() && month === start.getMonth();
+      const isLastMonth = year === target.getFullYear() && month === target.getMonth();
+      const from = isFirstMonth ? start.getDate() : 1;
+      // Stop the day before the target — a checkpoint records the balance at the
+      // start of its date, before that day's transactions.
+      const to = isLastMonth ? target.getDate() - 1 : getDaysInMonth(year, month);
+
+      for (let d = from; d <= to; d++) {
+        budget.incomes.forEach(income => {
+          getOccurrencesInMonth(income, year, month).forEach(occ => { if (occ.day === d) balance += occ.amount; });
+        });
+        budget.expenses.forEach(expense => {
+          getOccurrencesInMonth(expense, year, month).forEach(occ => { if (occ.day === d) balance -= occ.amount; });
+        });
+      }
+
+      month++;
+      if (month > 11) { month = 0; year++; }
+    }
+    return balance;
+  };
+
+  // Each checkpoint vs. what the budget predicted for that date. Drift is the
+  // money the budget didn't account for: negative means you spent more than planned.
+  const checkpointAnalysis = useMemo(() => {
+    const sorted = [...(data.checkpoints || [])].sort((a, b) => a.date.localeCompare(b.date));
+    return sorted.map(checkpoint => {
+      const prior = balanceAnchors.filter(a => a.date < checkpoint.date);
+      const anchor = prior.length ? prior[prior.length - 1] : balanceAnchors[0];
+      const predicted = projectBalanceAt(anchor, checkpoint.date);
+      const days = Math.max(1, Math.round((parseDate(checkpoint.date).getTime() - parseDate(anchor.date).getTime()) / 86400000));
+      const drift = checkpoint.actualBalance - predicted;
+      return { ...checkpoint, predicted, drift, anchorDate: anchor.date, days, driftPerMonth: (drift / days) * 30.44 };
+    });
+  }, [data, balanceAnchors]);
+
+  // What the drift says about the budget as a whole.
+  const driftInsight = useMemo(() => {
+    if (checkpointAnalysis.length === 0) return null;
+    const latest = checkpointAnalysis[checkpointAnalysis.length - 1];
+    const avgPerMonth = checkpointAnalysis.reduce((sum, c) => sum + c.driftPerMonth, 0) / checkpointAnalysis.length;
+    // Clamp: a checkpoint dated in the future shouldn't read as negative days
+    const daysSince = Math.max(0, Math.round((new Date().getTime() - parseDate(latest.date).getTime()) / 86400000));
+    return { latest, avgPerMonth, daysSince, count: checkpointAnalysis.length };
+  }, [checkpointAnalysis]);
+
+  // Walk a budget's whole timeline once, from the first real balance through the
+  // end of the requested month, and summarize each month. This is what makes
+  // comparing several budgets side by side affordable.
+  const projectTimeline = (
+    incomes: Income[],
+    expenses: Expense[],
+    endYear: number,
+    endMonth: number
+  ): MonthProjection[] => {
+    const first = balanceAnchors[0];
+    const start = parseDate(first.date);
+    const result: MonthProjection[] = [];
+
+    let balance = first.balance;
+    let year = start.getFullYear();
+    let month = start.getMonth();
+
+    while (year < endYear || (year === endYear && month <= endMonth)) {
+      const daysInMonth = getDaysInMonth(year, month);
+      const fromDay = (year === start.getFullYear() && month === start.getMonth()) ? start.getDate() : 1;
+      let lowest = Infinity;
+      let lowestDay = fromDay;
+      let income = 0;
+      let spend = 0;
+
+      for (let d = fromDay; d <= daysInMonth; d++) {
+        const checkpoint = checkpointByDate.get(`${monthKey(year, month)}-${String(d).padStart(2, '0')}`);
+        if (checkpoint !== undefined) balance = checkpoint;
+
+        incomes.forEach(item => {
+          getOccurrencesInMonth(item, year, month).forEach(occ => {
+            if (occ.day === d) { balance += occ.amount; income += occ.amount; }
+          });
+        });
+        expenses.forEach(item => {
+          getOccurrencesInMonth(item, year, month).forEach(occ => {
+            if (occ.day === d) { balance -= occ.amount; spend += occ.amount; }
+          });
+        });
+
+        if (balance < lowest) { lowest = balance; lowestDay = d; }
+      }
+
+      result.push({
+        year, month,
+        monthEnd: balance,
+        lowest: lowest === Infinity ? balance : lowest,
+        lowestDay, income, expenses: spend
+      });
+
+      month++;
+      if (month > 11) { month = 0; year++; }
+    }
+    return result;
+  };
+
+  // Headline numbers for one budget over the selected time range.
+  const summarizeBudget = (incomes: Income[], expenses: Expense[]) => {
+    const now = new Date();
+    const monthCounts: Record<string, number> = { '6m': 6, '1y': 12, '2y': 24, '5y': 60, '10y': 120, '15y': 180 };
+    const horizon = new Date(now.getFullYear(), now.getMonth() + (monthCounts[timeRange] || 12), 1);
+    const timeline = projectTimeline(incomes, expenses, horizon.getFullYear(), horizon.getMonth());
+
+    // Only look forward — the past is the same for every scenario
+    const future = timeline.filter(t => t.year > now.getFullYear() || (t.year === now.getFullYear() && t.month >= now.getMonth()));
+    const last = future[future.length - 1] ?? timeline[timeline.length - 1];
+
+    let lowest = Infinity;
+    let lowestAt: MonthProjection | null = null;
+    let firstNegative: MonthProjection | null = null;
+    for (const t of future) {
+      if (t.lowest < lowest) { lowest = t.lowest; lowestAt = t; }
+      if (!firstNegative && t.lowest < 0) firstNegative = t;
+    }
+
+    const totalIncome = future.reduce((sum, t) => sum + t.income, 0);
+    const totalSpend = future.reduce((sum, t) => sum + t.expenses, 0);
+
+    // When the last balance-tracked expense clears
+    let debtFreeDate: string | null = null;
+    let anyNeverClears = false;
+    expenses.filter(e => e.creditCard).forEach(e => {
+      const schedule = getBalanceSchedule(e);
+      if (schedule.neverPaysOff || !schedule.paidOffDate) anyNeverClears = true;
+      else if (!debtFreeDate || schedule.paidOffDate > debtFreeDate) debtFreeDate = schedule.paidOffDate;
+    });
+
+    return {
+      endBalance: last?.monthEnd ?? 0,
+      lowest: lowest === Infinity ? (last?.monthEnd ?? 0) : lowest,
+      lowestAt,
+      firstNegative,
+      avgNet: (totalIncome - totalSpend) / Math.max(1, future.length),
+      debtFreeDate,
+      anyNeverClears,
+      hasDebt: expenses.some(e => e.creditCard)
+    };
+  };
+
+  // Reality vs. every scenario. Only computed while the compare view is open.
+  const scenarioComparison = useMemo(() => {
+    if (modal !== 'scenario-compare') return null;
+    return [
+      { id: null as string | null, name: 'Reality', ...summarizeBudget(data.incomes, data.expenses) },
+      ...(data.scenarios || []).map(s => ({ id: s.id as string | null, name: s.name, ...summarizeBudget(s.incomes, s.expenses) }))
+    ];
+  }, [modal, data, balanceAnchors, checkpointByDate, timeRange]);
 
   const months = useMemo(() => {
     const result = [];
@@ -1257,59 +1835,49 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   }, [timeRange, data.startingDate]);
   const alerts = useMemo(() => { const result = []; if (stats.lowestBalance < data.floorThreshold) result.push({ type: 'danger', title: 'Critical Balance Alert', text: `Balance drops to ${formatCurrency(stats.lowestBalance)} on day ${stats.lowestDay}` }); else if (stats.lowestBalance < data.warningThreshold) result.push({ type: 'warning', title: 'Low Balance Warning', text: `Balance drops to ${formatCurrency(stats.lowestBalance)} on day ${stats.lowestDay}` }); return result; }, [stats, data.floorThreshold, data.warningThreshold]);
   const getBalanceStatus = (balance: number) => { if (balance < data.floorThreshold) return 'danger'; if (balance < data.warningThreshold) return 'warning'; return 'safe'; };
-  const groupedExpenses = useMemo(() => { const groups: Record<string, Expense[]> = {}; expenseCategories.forEach(cat => { groups[cat.value] = []; }); data.expenses.forEach(expense => { (groups[expense.category] || groups['other']).push(expense); }); return groups; }, [data.expenses]);
+  const groupedExpenses = useMemo(() => {
+    const groups: Record<string, ItemSeries<Expense>[]> = {};
+    expenseCategories.forEach(cat => { groups[cat.value] = []; });
+    // Group by series so successive versions of one expense share a row
+    groupIntoSeries(budget.expenses).forEach(series => {
+      (groups[series.current.category] || groups['other']).push(series);
+    });
+    return groups;
+  }, [budget.expenses]);
 
-  // Calculate current remaining balance for credit cards
-  const getCreditCardRemainingBalance = (expense: Expense): { remaining: number; isPaidOff: boolean; monthsRemaining: number; payoffDate: string | null } => {
+  const incomeSeries = useMemo(() => groupIntoSeries(regularIncomes), [regularIncomes]);
+
+  const toggleSeries = (key: string) =>
+    setExpandedSeries(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]);
+
+  // "Was $1,650.00/mo until Aug 31, 2026"
+  const versionSummary = (item: Income | Expense) =>
+    `${formatCurrency(item.amount)} ${frequencyLabels[item.frequency] || ''}`
+    + (item.startDate || item.date ? ` from ${new Date((item.startDate || item.date)! + 'T12:00:00').toLocaleDateString()}` : '')
+    + (item.endDate ? ` until ${new Date(item.endDate + 'T12:00:00').toLocaleDateString()}` : '');
+
+  // Remaining balance and payoff outlook for any balance-tracked expense,
+  // as of the month currently being viewed.
+  const getTrackedBalance = (expense: Expense): { remaining: number; isPaidOff: boolean; monthsRemaining: number; payoffDate: string | null } => {
     if (!expense.creditCard) return { remaining: 0, isPaidOff: true, monthsRemaining: 0, payoffDate: null };
-    
-    // Use selected month for projection
+
     const { year, month } = selectedMonth;
-    const status = getCreditCardBalanceAtMonth(expense, year, month);
-    const remaining = Math.max(0, status.remainingBalance);
-    
-    // Calculate months remaining until payoff from selected month
-    let monthsRemaining = 0;
-    let payoffDate: string | null = null;
-    
-    if (!status.isPaidOff && remaining > 0) {
-      const cc = expense.creditCard;
-      const apr = cc.apr || 0;
-      const monthlyRate = (apr / 100) / 12;
-      const payment = expense.amount;
-      
-      // Simulate forward to find payoff
-      let balance = remaining;
-      let projYear = year;
-      let projMonth = month;
-      const maxMonths = 360; // 30 year cap
-      
-      while (balance > 0 && monthsRemaining < maxMonths) {
-        // Add interest
-        balance += balance * monthlyRate;
-        // Subtract payment
-        balance -= payment;
-        monthsRemaining++;
-        
-        // Move to next month
-        projMonth++;
-        if (projMonth > 11) {
-          projMonth = 0;
-          projYear++;
-        }
-        
-        if (balance <= 0) {
-          payoffDate = new Date(projYear, projMonth, 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
-          break;
-        }
-      }
-      
-      if (monthsRemaining >= maxMonths) {
-        payoffDate = 'Never (payment too low)';
-      }
+    const schedule = getBalanceSchedule(expense);
+    const remaining = getRemainingBalanceAtMonth(expense, year, month);
+
+    if (remaining <= 0.005) return { remaining: 0, isPaidOff: true, monthsRemaining: 0, payoffDate: null };
+    if (schedule.neverPaysOff || !schedule.paidOffDate) {
+      return { remaining, isPaidOff: false, monthsRemaining: 0, payoffDate: 'Never (payment too low)' };
     }
-    
-    return { remaining, isPaidOff: status.isPaidOff, monthsRemaining, payoffDate };
+
+    const payoff = parseDate(schedule.paidOffDate);
+    const monthsRemaining = Math.max(0, (payoff.getFullYear() - year) * 12 + (payoff.getMonth() - month));
+    return {
+      remaining,
+      isPaidOff: false,
+      monthsRemaining,
+      payoffDate: payoff.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+    };
   };
 
   const handleEditEvent = (event: DayEvent) => {
@@ -1319,8 +1887,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     const threeMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 3, 1);
     
     const item = event.type === 'income' 
-      ? data.incomes.find(i => i.id === event.id)
-      : data.expenses.find(e => e.id === event.id);
+      ? budget.incomes.find(i => i.id === event.id)
+      : budget.expenses.find(e => e.id === event.id);
     
     if (!item) return;
     
@@ -1407,10 +1975,104 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       </header>
 
       <main className="p-2 sm:p-4 max-w-6xl mx-auto">
+        {/* Scenario bar — always visible so you know which budget you're editing */}
+        <div className={`mb-3 p-2 sm:p-3 rounded-xl border flex flex-col sm:flex-row sm:items-center gap-2 ${activeScenario ? 'bg-purple-500/10 border-purple-500/40' : 'bg-gray-900 border-gray-800'}`}>
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <span className="text-lg">{activeScenario ? '🧪' : '🌍'}</span>
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-wide text-gray-500">Viewing</div>
+              {renamingScenario && activeScenario ? (
+                <input
+                  autoFocus
+                  defaultValue={activeScenario.name}
+                  onBlur={e => renameScenario(activeScenario.id, e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') renameScenario(activeScenario.id, (e.target as HTMLInputElement).value); }}
+                  className="px-2 py-0.5 bg-gray-800 border border-gray-700 rounded text-white text-sm"
+                />
+              ) : (
+                <select
+                  value={activeScenarioId ?? ''}
+                  onChange={e => setActiveScenarioId(e.target.value || null)}
+                  className={`bg-transparent font-semibold text-sm focus:outline-none cursor-pointer ${activeScenario ? 'text-purple-300' : 'text-white'}`}
+                >
+                  <option value="" className="bg-gray-900 text-white">Reality</option>
+                  {(data.scenarios || []).map(s => (
+                    <option key={s.id} value={s.id} className="bg-gray-900 text-white">{s.name}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+            {activeScenario && (
+              <button
+                onClick={() => setModal('scenario-changes')}
+                className="ml-1 px-2 py-1 bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 rounded text-xs font-medium whitespace-nowrap"
+              >
+                {scenarioDiff.length} change{scenarioDiff.length === 1 ? '' : 's'}
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {activeScenario && (
+              <>
+                <button onClick={() => setRenamingScenario(true)} className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-xs">Rename</button>
+                <button onClick={() => setModal('scenario-discard')} className="px-2.5 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 rounded-lg text-xs">Discard</button>
+              </>
+            )}
+            {(data.scenarios || []).length > 0 && (
+              <button onClick={() => setModal('scenario-compare')} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-medium">Compare</button>
+            )}
+            <button onClick={() => { setScenarioName(''); setModal('scenario-new'); }} className="px-2.5 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-xs font-medium whitespace-nowrap">
+              + Scenario
+            </button>
+          </div>
+        </div>
+
+        {activeScenario && (
+          <div className="mb-3 text-xs text-purple-300/70 px-1">
+            Sandbox — edits here don&apos;t touch Reality. Forked {new Date(activeScenario.createdAt + 'T12:00:00').toLocaleDateString()}.
+          </div>
+        )}
+
         {activeTab === 'dashboard' && (
           <div className="space-y-3">
             {alerts.map((alert, i) => (<div key={i} className={`p-3 rounded-lg flex items-start gap-2 ${alert.type === 'danger' ? 'bg-red-500/10 border border-red-500/30 text-red-400' : 'bg-yellow-500/10 border border-yellow-500/30 text-yellow-400'}`}><span className="text-lg">{alert.type === 'danger' ? '🚨' : '⚠️'}</span><div><div className="font-semibold text-sm">{alert.title}</div><div className="text-xs opacity-90">{alert.text}</div></div></div>))}
             
+            {/* Reality check — is the projection still tracking the real account? */}
+            {(!driftInsight || driftInsight.daysSince >= 14) && (
+              <div className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/30 flex flex-col sm:flex-row sm:items-center gap-2">
+                <span className="text-lg">🎯</span>
+                <div className="flex-1">
+                  <div className="font-semibold text-sm text-blue-300">
+                    {driftInsight ? `Last reality check was ${driftInsight.daysSince} days ago` : 'Check the projection against reality'}
+                  </div>
+                  <div className="text-xs text-blue-300/80">
+                    Record your real bank balance so projections re-anchor and you can see how far the budget drifted.
+                  </div>
+                </div>
+                <button
+                  onClick={() => setActiveTab('settings')}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg whitespace-nowrap"
+                >
+                  Record balance
+                </button>
+              </div>
+            )}
+
+            {driftInsight && driftInsight.daysSince < 14 && Math.abs(driftInsight.latest.drift) >= 1 && (
+              <div className={`p-3 rounded-lg flex items-start gap-2 ${driftInsight.latest.drift < 0 ? 'bg-red-500/10 border border-red-500/30' : 'bg-green-500/10 border border-green-500/30'}`}>
+                <span className="text-lg">{driftInsight.latest.drift < 0 ? '📉' : '📈'}</span>
+                <div>
+                  <div className={`font-semibold text-sm ${driftInsight.latest.drift < 0 ? 'text-red-400' : 'text-green-400'}`}>
+                    {driftInsight.latest.drift < 0 ? 'Behind' : 'Ahead of'} projection by {formatCurrency(Math.abs(driftInsight.latest.drift))}
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    Over the {driftInsight.latest.days} days since your last checkpoint — about {formatCurrency(Math.abs(driftInsight.latest.driftPerMonth))}/mo unaccounted for.
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
               {[{ label: 'Today\'s Balance', value: todaysBalance }, { label: 'Lowest Point', value: stats.lowestBalance, sub: `Day ${stats.lowestDay}` }, { label: 'Month End', value: stats.endingBalance }, { label: 'Variable Budget', value: stats.availableForVariable }].map((stat, i) => (
                 <div key={i} className="bg-gray-900 border border-gray-800 rounded-xl p-3">
@@ -1659,8 +2321,12 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                     day.events.length > 0 ? (
                       day.events.map((event, eventIdx) => {
                         const catColor = event.type === 'expense' ? getCategoryColor(event.category || 'other', data.categoryColors) : null;
+                        // Balance after this specific transaction, not just the day's close
+                        const eventBalance = event.runningBalance ?? day.balance;
+                        const isDayClose = eventIdx === day.events.length - 1;
+                        const balanceStatus = getBalanceStatus(eventBalance);
                         return (
-                        <div key={`${day.day}-${eventIdx}`} className={`grid grid-cols-12 px-3 py-2 border-b border-gray-800 items-center ${event.isSkipped ? 'bg-gray-500/5' : day.balance < data.floorThreshold ? 'bg-red-500/5' : ''}`}>
+                        <div key={`${day.day}-${eventIdx}`} className={`grid grid-cols-12 px-3 py-2 border-b border-gray-800 items-center ${event.isSkipped ? 'bg-gray-500/5' : eventBalance < data.floorThreshold ? 'bg-red-500/5' : ''}`}>
                           <div className="col-span-1 font-mono font-semibold text-gray-400 text-sm">
                             {eventIdx === 0 ? day.day : ''}
                           </div>
@@ -1678,8 +2344,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                           <div className={`col-span-3 sm:col-span-2 text-right font-mono text-sm font-semibold ${event.isSkipped ? 'text-gray-500' : event.type === 'income' ? 'text-emerald-400' : catColor?.text}`}>
                             {event.isSkipped ? '$0.00' : (event.type === 'income' ? '+' : '-') + formatCurrency(event.amount).replace('$', '$')}
                           </div>
-                          <div className={`col-span-3 text-right font-mono text-sm font-semibold ${eventIdx === day.events.length - 1 ? (getBalanceStatus(day.balance) === 'safe' ? 'text-green-400' : getBalanceStatus(day.balance) === 'warning' ? 'text-yellow-400' : 'text-red-400') : 'text-gray-600'}`}>
-                            {eventIdx === day.events.length - 1 ? formatCurrency(day.balance) : ''}
+                          <div className={`col-span-3 text-right font-mono text-sm ${isDayClose ? 'font-semibold' : 'font-normal opacity-70'} ${balanceStatus === 'safe' ? 'text-green-400' : balanceStatus === 'warning' ? 'text-yellow-400' : 'text-red-400'}`}>
+                            {formatCurrency(eventBalance)}
                           </div>
                         </div>
                         );
@@ -1719,8 +2385,12 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                 ) : (
                   <>
                     {/* Regular Income Items */}
-                    {regularIncomes.map(income => (
-                      <div key={income.id} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 border rounded-lg ${income.endDate ? 'bg-gray-800/50 border-gray-700/50' : 'bg-gray-800 border-gray-700'}`}>
+                    {incomeSeries.map(series => {
+                      const income = series.current;
+                      const priorVersions = series.versions.slice(0, -1);
+                      const isExpanded = expandedSeries.includes(series.key);
+                      return (
+                      <div key={series.key} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 border rounded-lg ${income.endDate ? 'bg-gray-800/50 border-gray-700/50' : 'bg-gray-800 border-gray-700'}`}>
                         <div className="flex-1 min-w-0">
                           <div className="font-medium truncate flex items-center gap-2">
                             {income.name}
@@ -1734,13 +2404,41 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                             {frequencyLabels[income.frequency]} • {income.frequency === 'once' ? new Date(income.date! + 'T12:00:00').toLocaleDateString() : `Starting ${new Date(income.startDate! + 'T12:00:00').toLocaleDateString()}`}
                             {income.endDate && (
                               <button
-                                onClick={() => updateData({ incomes: data.incomes.map(i => i.id === income.id ? { ...i, endDate: undefined } : i) })}
+                                onClick={() => updateBudget({ incomes: budget.incomes.map(i => i.id === income.id ? { ...i, endDate: undefined } : i) })}
                                 className="ml-2 text-blue-400 hover:text-blue-300 underline"
                               >
                                 Resume
                               </button>
                             )}
                           </div>
+
+                          {/* Earlier versions — e.g. what you earned before the raise */}
+                          {priorVersions.length > 0 && (
+                            <div className="mt-1">
+                              <button
+                                onClick={() => toggleSeries(series.key)}
+                                className="text-xs text-blue-400 hover:text-blue-300"
+                              >
+                                {isExpanded ? '▾' : '▸'} {series.versions.length} versions
+                              </button>
+                              {isExpanded && (
+                                <div className="mt-1 space-y-1 border-l border-gray-700 pl-2">
+                                  {priorVersions.map(version => (
+                                    <div key={version.id} className="flex items-center justify-between gap-2 text-xs text-gray-500">
+                                      <span>{versionSummary(version)}</span>
+                                      <button
+                                        onClick={() => updateBudget({ incomes: budget.incomes.filter(i => i.id !== version.id) })}
+                                        className="text-red-400/60 hover:text-red-400"
+                                        title="Delete this version (removes its history)"
+                                      >
+                                        ×
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                         <div className="flex items-center justify-between sm:justify-end gap-2">
                           <div className="font-mono text-emerald-400 font-semibold text-lg">{formatCurrency(income.amount)}</div>
@@ -1750,7 +2448,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                           </div>
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </>
                 )}
               </div>
@@ -1779,8 +2478,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                     // Helper to clear all past payments
                     const clearPastPayments = () => {
                       const updatedPayments = allPayments.filter(p => p.date >= currentMonthStart);
-                      updateData({
-                        incomes: data.incomes.map(i =>
+                      updateBudget({
+                        incomes: budget.incomes.map(i =>
                           i.id === gig.id ? { ...i, scheduledPayments: updatedPayments } : i
                         )
                       });
@@ -1910,7 +2609,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                 </div>
               </div>
               <div className="p-3 space-y-4">
-                {data.expenses.length === 0 ? (<div className="text-center py-8 text-gray-500"><div className="text-3xl mb-2">📋</div><div className="font-medium">No expenses yet</div></div>) : (
+                {budget.expenses.length === 0 ? (<div className="text-center py-8 text-gray-500"><div className="text-3xl mb-2">📋</div><div className="font-medium">No expenses yet</div></div>) : (
                   expenseCategories.map(cat => {
                     const items = groupedExpenses[cat.value];
                     if (!items || items.length === 0) return null;
@@ -1925,8 +2624,11 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                           )}
                         </h3>
                         <div className="space-y-2">
-                          {items.map(expense => {
-                            const ccBalance = expense.creditCard ? getCreditCardRemainingBalance(expense) : null;
+                          {items.map(series => {
+                            const expense = series.current;
+                            const priorVersions = series.versions.slice(0, -1);
+                            const isExpanded = expandedSeries.includes(series.key);
+                            const ccBalance = expense.creditCard ? getTrackedBalance(expense) : null;
                             const catColor = getCategoryColor(expense.category, data.categoryColors);
                             const isPaidOff = ccBalance?.isPaidOff;
                             const openEditor = () => {
@@ -1978,13 +2680,41 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                   )}
                                   {expense.endDate && (
                                     <button
-                                      onClick={() => updateData({ expenses: data.expenses.map(e => e.id === expense.id ? { ...e, endDate: undefined } : e) })}
+                                      onClick={() => updateBudget({ expenses: budget.expenses.map(e => e.id === expense.id ? { ...e, endDate: undefined } : e) })}
                                       className="ml-2 text-blue-400 hover:text-blue-300 underline"
                                     >
                                       Resume
                                     </button>
                                   )}
                                 </div>
+
+                                {/* Earlier versions of this expense, kept so history stays true */}
+                                {priorVersions.length > 0 && (
+                                  <div className="ml-4 mt-1">
+                                    <button
+                                      onClick={() => toggleSeries(series.key)}
+                                      className="text-xs text-blue-400 hover:text-blue-300"
+                                    >
+                                      {isExpanded ? '▾' : '▸'} {series.versions.length} versions
+                                    </button>
+                                    {isExpanded && (
+                                      <div className="mt-1 space-y-1 border-l border-gray-700 pl-2">
+                                        {priorVersions.map(version => (
+                                          <div key={version.id} className="flex items-center justify-between gap-2 text-xs text-gray-500">
+                                            <span>{versionSummary(version)}</span>
+                                            <button
+                                              onClick={() => updateBudget({ expenses: budget.expenses.filter(e => e.id !== version.id) })}
+                                              className="text-red-400/60 hover:text-red-400"
+                                              title="Delete this version (removes its history)"
+                                            >
+                                              ×
+                                            </button>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
                                 {isPaidOff && (
                                   <div className="mt-2 ml-4 flex flex-wrap items-center gap-2 p-2 bg-green-500/10 border border-green-500/20 rounded-lg">
                                     <span className="text-xs text-green-300">Balance cleared — adjust or remove this expense?</span>
@@ -2040,7 +2770,128 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                     <input type="date" value={data.startingDate} onChange={(e) => updateData({ startingDate: e.target.value })} className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white" />
                   </div>
                 </div>
-                <div className="text-xs text-gray-500">Enter your actual bank balance and the date it was recorded. All calculations will start from this point.</div>
+                <div className="text-xs text-gray-500">Your first real bank balance. Projections run from here until you record a newer checkpoint below.</div>
+              </div>
+            </div>
+
+            {/* Reality check — actual balances vs. what the budget predicted */}
+            <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+              <div className="p-3 bg-gray-800 border-b border-gray-700">
+                <h2 className="font-semibold">Balance Checkpoints</h2>
+                <p className="text-xs text-gray-500 mt-1">Record your real bank balance now and then. Projections re-anchor to the newest one, and the gap against the prediction shows how well your budget matches reality.</p>
+              </div>
+
+              {checkpointColumnMissing && (
+                <div className="m-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs text-yellow-300 space-y-1">
+                  <div className="font-semibold">Checkpoints and scenarios aren&apos;t saving to your database yet.</div>
+                  <div className="text-yellow-300/80">Run this once in the Supabase SQL editor:</div>
+                  <code className="block p-2 bg-gray-950 rounded font-mono text-[11px] text-yellow-200 overflow-x-auto whitespace-pre">
+{`ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS checkpoints JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb;`}
+                  </code>
+                </div>
+              )}
+
+              <div className="p-3 space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                  <div>
+                    <label className="text-xs text-gray-500 uppercase block mb-1">Date</label>
+                    <input
+                      type="date"
+                      value={newCheckpoint.date}
+                      onChange={e => setNewCheckpoint({ ...newCheckpoint, date: e.target.value })}
+                      className="w-full p-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 uppercase block mb-1">Actual Balance</label>
+                    <input
+                      type="number"
+                      value={newCheckpoint.amount}
+                      onChange={e => setNewCheckpoint({ ...newCheckpoint, amount: e.target.value })}
+                      className="w-full p-2 bg-gray-800 border border-gray-700 rounded-lg text-white font-mono text-sm"
+                      placeholder="0.00"
+                      step="0.01"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 uppercase block mb-1">Note (optional)</label>
+                    <input
+                      type="text"
+                      value={newCheckpoint.note}
+                      onChange={e => setNewCheckpoint({ ...newCheckpoint, note: e.target.value })}
+                      className="w-full p-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm"
+                      placeholder="e.g., after payday"
+                    />
+                  </div>
+                  <div className="flex items-end">
+                    <button
+                      onClick={addCheckpoint}
+                      disabled={!newCheckpoint.date || newCheckpoint.amount === ''}
+                      className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50"
+                    >
+                      Record
+                    </button>
+                  </div>
+                </div>
+
+                {checkpointAnalysis.length === 0 ? (
+                  <div className="text-center py-6 text-gray-500">
+                    <div className="text-2xl mb-1">🎯</div>
+                    <div className="text-sm">No checkpoints yet</div>
+                    <div className="text-xs text-gray-600 mt-1">Record today&apos;s balance to start measuring drift.</div>
+                  </div>
+                ) : (
+                  <>
+                    {driftInsight && (
+                      <div className={`p-3 rounded-lg border ${Math.abs(driftInsight.avgPerMonth) < 25 ? 'bg-green-500/10 border-green-500/30' : driftInsight.avgPerMonth < 0 ? 'bg-red-500/10 border-red-500/30' : 'bg-blue-500/10 border-blue-500/30'}`}>
+                        {Math.abs(driftInsight.avgPerMonth) < 25 ? (
+                          <div className="text-sm text-green-300">
+                            <span className="font-semibold">Your budget is accurate.</span> Reality tracks the projection within {formatCurrency(Math.abs(driftInsight.avgPerMonth))}/mo.
+                          </div>
+                        ) : driftInsight.avgPerMonth < 0 ? (
+                          <div className="text-sm text-red-300">
+                            <span className="font-semibold">You&apos;re running {formatCurrency(Math.abs(driftInsight.avgPerMonth))}/mo behind projection.</span>
+                            <span className="text-red-300/80"> That&apos;s spending the budget doesn&apos;t know about — long-range projections are optimistic by roughly {formatCurrency(Math.abs(driftInsight.avgPerMonth) * 12)}/year.</span>
+                          </div>
+                        ) : (
+                          <div className="text-sm text-blue-300">
+                            <span className="font-semibold">You&apos;re running {formatCurrency(driftInsight.avgPerMonth)}/mo ahead of projection.</span>
+                            <span className="text-blue-300/80"> Either income is understated or some expenses cost less than budgeted.</span>
+                          </div>
+                        )}
+                        <div className="text-xs text-gray-400 mt-1">
+                          Based on {driftInsight.count} checkpoint{driftInsight.count === 1 ? '' : 's'} • last recorded {driftInsight.daysSince === 0 ? 'today' : `${driftInsight.daysSince} day${driftInsight.daysSince === 1 ? '' : 's'} ago`}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="border border-gray-800 rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 bg-gray-800 px-3 py-2 text-xs font-semibold text-gray-500 uppercase">
+                        <div className="col-span-3">Date</div>
+                        <div className="col-span-3 text-right">Predicted</div>
+                        <div className="col-span-3 text-right">Actual</div>
+                        <div className="col-span-3 text-right">Drift</div>
+                      </div>
+                      {[...checkpointAnalysis].reverse().map(row => (
+                        <div key={row.id} className="grid grid-cols-12 px-3 py-2 border-t border-gray-800 items-center text-sm">
+                          <div className="col-span-3">
+                            <div className="text-gray-300">{new Date(row.date + 'T12:00:00').toLocaleDateString()}</div>
+                            {row.note && <div className="text-xs text-gray-600 truncate">{row.note}</div>}
+                          </div>
+                          <div className="col-span-3 text-right font-mono text-gray-500">{formatCurrency(row.predicted)}</div>
+                          <div className="col-span-3 text-right font-mono text-gray-200">{formatCurrency(row.actualBalance)}</div>
+                          <div className="col-span-3 text-right flex items-center justify-end gap-2">
+                            <span className={`font-mono font-semibold ${Math.abs(row.drift) < 1 ? 'text-gray-500' : row.drift < 0 ? 'text-red-400' : 'text-green-400'}`}>
+                              {row.drift >= 0 ? '+' : '−'}{formatCurrency(Math.abs(row.drift))}
+                            </span>
+                            <button onClick={() => deleteCheckpoint(row.id)} className="px-2 py-0.5 bg-red-500/10 text-red-400 rounded text-xs">×</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
               </div>
             </div>
             <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
@@ -2225,16 +3076,241 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
               setModal(null); setEditingItem(null); setEditingEvent(null);
             }}
             onClose={() => { setModal(null); setEditingItem(null); setEditingEvent(null); }}
-            creditCardBalance={
-              (editingItem as Expense).creditCard 
-                ? getCreditCardBalanceAtMonth(
+            trackedBalance={
+              (editingItem as Expense).creditCard
+                ? getRemainingBalanceAtMonth(
                     editingItem as Expense,
                     parseInt(editingEvent.instanceDate.split('-')[0]),
                     parseInt(editingEvent.instanceDate.split('-')[1]) - 1
-                  ).remainingBalance
+                  )
                 : undefined
             }
           />
+        </Modal>
+      )}
+
+      {/* How should an edit to a running item apply — retroactively, or from now? */}
+      {modal === 'apply-change' && pendingChange && (
+        <Modal title={`Change to ${pendingChange.name}`} onClose={() => { setPendingChange(null); setModal(null); }}>
+          <div className="p-4 space-y-4">
+            <div className="p-3 bg-gray-800 rounded-lg">
+              <div className="text-xs text-gray-500 uppercase mb-1">What&apos;s changing</div>
+              {pendingChange.changes.map((c, i) => (
+                <div key={i} className="font-mono text-sm text-yellow-400">{c}</div>
+              ))}
+            </div>
+
+            <div className="text-sm text-gray-400">
+              This {pendingChange.type} already has past occurrences. How should the change apply?
+            </div>
+
+            <button
+              type="button"
+              onClick={() => applyPendingChange('forward')}
+              className="w-full text-left p-3 bg-blue-600/10 hover:bg-blue-600/20 border border-blue-500/40 rounded-lg"
+            >
+              <div className="font-medium text-blue-300">Life changed — apply going forward</div>
+              <div className="text-xs text-gray-400 mt-1">
+                Everything before this date stays exactly as it was. The old version is kept as history.
+              </div>
+              <div className="mt-2 flex items-center gap-2" onClick={e => e.stopPropagation()}>
+                <span className="text-xs text-gray-500 uppercase">Effective</span>
+                <input
+                  type="date"
+                  value={pendingChange.effectiveFrom}
+                  onChange={e => setPendingChange({ ...pendingChange, effectiveFrom: e.target.value })}
+                  className="p-2 bg-gray-800 border border-gray-700 rounded text-white text-sm"
+                />
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => applyPendingChange('retroactive')}
+              className="w-full text-left p-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg"
+            >
+              <div className="font-medium text-gray-200">Correct a mistake — apply to all history</div>
+              <div className="text-xs text-gray-400 mt-1">
+                Rewrites {pendingChange.pastCount > 500 ? '500+' : pendingChange.pastCount} past occurrence{pendingChange.pastCount === 1 ? '' : 's'} as if it had always been this way. Past balances will change.
+              </div>
+              {pendingChange.orphanedOverrides > 0 && (
+                <div className="text-xs text-yellow-400/80 mt-1">
+                  Moving the start date also discards {pendingChange.orphanedOverrides} per-instance edit{pendingChange.orphanedOverrides === 1 ? '' : 's'} that no longer {pendingChange.orphanedOverrides === 1 ? 'lines' : 'line'} up.
+                </div>
+              )}
+            </button>
+          </div>
+          <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
+            <button onClick={() => { setPendingChange(null); setModal(null); }} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Cancel</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Fork a new scenario from whatever budget is on screen */}
+      {modal === 'scenario-new' && (
+        <Modal title="New Scenario" onClose={() => setModal(null)}>
+          <div className="p-4 space-y-3">
+            <div className="text-sm text-gray-300">
+              Forks {activeScenario ? `"${activeScenario.name}"` : 'Reality'} into a sandbox you can change freely. Your real budget stays untouched.
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 uppercase block mb-1">Name</label>
+              <input
+                autoFocus
+                type="text"
+                value={scenarioName}
+                onChange={e => setScenarioName(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && scenarioName.trim()) createScenario(scenarioName); }}
+                className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
+                placeholder="e.g., New job, Move to Austin, Lose the side gig"
+              />
+            </div>
+            <div className="text-xs text-gray-500">
+              Your starting balance and recorded checkpoints are shared — every scenario projects from the same real starting point.
+            </div>
+          </div>
+          <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
+            <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Cancel</button>
+            <button
+              onClick={() => createScenario(scenarioName)}
+              disabled={!scenarioName.trim()}
+              className="px-4 py-2 bg-purple-600 text-white rounded-lg font-medium disabled:opacity-50"
+            >
+              Create sandbox
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {/* What this scenario changed, with the option to make any of it real */}
+      {modal === 'scenario-changes' && activeScenario && (
+        <Modal title={`${activeScenario.name} vs. Reality`} onClose={() => setModal(null)}>
+          <div className="p-4 space-y-2 max-h-[60vh] overflow-y-auto">
+            {scenarioDiff.length === 0 ? (
+              <div className="text-center py-8 text-gray-500">
+                <div className="text-2xl mb-2">🧪</div>
+                <div className="text-sm">Identical to Reality so far</div>
+                <div className="text-xs text-gray-600 mt-1">Edit income or expenses to see the difference here.</div>
+              </div>
+            ) : (
+              scenarioDiff.map(change => (
+                <div key={change.key} className="p-3 bg-gray-800 border border-gray-700 rounded-lg flex flex-col sm:flex-row sm:items-center gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`font-mono text-sm ${change.kind === 'added' ? 'text-green-400' : change.kind === 'removed' ? 'text-red-400' : 'text-yellow-400'}`}>
+                        {change.kind === 'added' ? '+' : change.kind === 'removed' ? '−' : '~'}
+                      </span>
+                      <span className="font-medium truncate">{change.name}</span>
+                      <span className="text-xs text-gray-500 uppercase">{change.type}</span>
+                    </div>
+                    <div className="text-xs text-gray-400 ml-5">{change.details.join(' • ')}</div>
+                  </div>
+                  <button
+                    onClick={() => promoteChange(change)}
+                    className="px-3 py-1.5 bg-green-600/20 hover:bg-green-600/30 text-green-300 border border-green-500/30 rounded text-xs font-medium whitespace-nowrap"
+                  >
+                    Make real
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+          <div className="flex justify-between items-center gap-3 p-4 border-t border-gray-800">
+            <div className="text-xs text-gray-500">&quot;Make real&quot; applies one change to Reality and leaves the sandbox as-is.</div>
+            <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Side-by-side outcomes */}
+      {modal === 'scenario-compare' && scenarioComparison && (
+        <Modal title={`Compare — next ${timeRange}`} onClose={() => setModal(null)}>
+          <div className="p-4 overflow-x-auto">
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="text-xs uppercase text-gray-500">
+                  <th className="text-left font-semibold py-2 pr-3">Outcome</th>
+                  {scenarioComparison.map(row => (
+                    <th key={row.id ?? 'reality'} className={`text-right font-semibold py-2 px-3 whitespace-nowrap ${row.id === activeScenarioId ? 'text-purple-300' : row.id === null ? 'text-white' : 'text-gray-400'}`}>
+                      {row.name}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="font-mono">
+                <tr className="border-t border-gray-800">
+                  <td className="py-2 pr-3 font-sans text-gray-400">Balance at end</td>
+                  {scenarioComparison.map(row => (
+                    <td key={row.id ?? 'reality'} className={`text-right py-2 px-3 font-semibold ${row.endBalance < 0 ? 'text-red-400' : 'text-green-400'}`}>
+                      {formatCurrency(row.endBalance)}
+                    </td>
+                  ))}
+                </tr>
+                <tr className="border-t border-gray-800">
+                  <td className="py-2 pr-3 font-sans text-gray-400">Lowest point</td>
+                  {scenarioComparison.map(row => (
+                    <td key={row.id ?? 'reality'} className={`text-right py-2 px-3 ${row.lowest < data.floorThreshold ? 'text-red-400' : 'text-gray-200'}`}>
+                      {formatCurrency(row.lowest)}
+                      {row.lowestAt && (
+                        <div className="text-[10px] font-sans text-gray-600">
+                          {new Date(row.lowestAt.year, row.lowestAt.month).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}
+                        </div>
+                      )}
+                    </td>
+                  ))}
+                </tr>
+                <tr className="border-t border-gray-800">
+                  <td className="py-2 pr-3 font-sans text-gray-400">Goes negative</td>
+                  {scenarioComparison.map(row => (
+                    <td key={row.id ?? 'reality'} className={`text-right py-2 px-3 font-sans ${row.firstNegative ? 'text-red-400' : 'text-green-400'}`}>
+                      {row.firstNegative
+                        ? new Date(row.firstNegative.year, row.firstNegative.month).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+                        : 'Never'}
+                    </td>
+                  ))}
+                </tr>
+                <tr className="border-t border-gray-800">
+                  <td className="py-2 pr-3 font-sans text-gray-400">Avg monthly net</td>
+                  {scenarioComparison.map(row => (
+                    <td key={row.id ?? 'reality'} className={`text-right py-2 px-3 ${row.avgNet < 0 ? 'text-red-400' : 'text-green-400'}`}>
+                      {row.avgNet >= 0 ? '+' : '−'}{formatCurrency(Math.abs(row.avgNet))}
+                    </td>
+                  ))}
+                </tr>
+                <tr className="border-t border-gray-800">
+                  <td className="py-2 pr-3 font-sans text-gray-400">Debt-free</td>
+                  {scenarioComparison.map(row => (
+                    <td key={row.id ?? 'reality'} className="text-right py-2 px-3 font-sans text-gray-200">
+                      {!row.hasDebt ? <span className="text-gray-600">No balances</span>
+                        : row.anyNeverClears ? <span className="text-red-400">Never</span>
+                        : row.debtFreeDate ? new Date(row.debtFreeDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+                        : <span className="text-green-400">Clear</span>}
+                    </td>
+                  ))}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-between items-center gap-3 p-4 border-t border-gray-800">
+            <div className="text-xs text-gray-500">All scenarios project from the same real starting balance.</div>
+            <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Close</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Discard a sandbox */}
+      {modal === 'scenario-discard' && activeScenario && (
+        <Modal title={`Discard "${activeScenario.name}"?`} onClose={() => setModal(null)}>
+          <div className="p-4 space-y-2">
+            <div className="text-sm text-gray-300">
+              This deletes the sandbox and its {scenarioDiff.length} change{scenarioDiff.length === 1 ? '' : 's'}. Reality is unaffected.
+            </div>
+            <div className="text-xs text-gray-500">Anything you wanted to keep should be made real first.</div>
+          </div>
+          <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
+            <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Cancel</button>
+            <button onClick={() => deleteScenario(activeScenario.id)} className="px-4 py-2 bg-red-600 text-white rounded-lg font-medium">Discard sandbox</button>
+          </div>
         </Modal>
       )}
 
