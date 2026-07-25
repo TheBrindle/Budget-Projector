@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
 import { CashFlowData, CreditCard, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
-import { getPeriodRate } from '@/lib/payoff';
+import { getPeriodRate, getDailyRate, daysBetween, resolveInterestMethod } from '@/lib/payoff';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
 import OneTimeIncomeForm from './forms/OneTimeIncomeForm';
@@ -620,6 +620,9 @@ interface BalanceSchedule {
   months: Map<string, (number | null)[]>;
   // 'YYYY-MM' -> balance remaining at the end of that month
   endBalances: Map<string, number>;
+  // 'YYYY-MM-DD' -> balance immediately after that date's payment. Lets any date
+  // be answered without re-running the amortization.
+  balanceAfter: Map<string, number>;
   firstMonth: string; // month containing balanceAsOfDate; nothing before it is touched
   startBalance: number;
   paidOffDate: string | null; // date of the payment that cleared the balance
@@ -636,10 +639,18 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
   const cc = expense.creditCard!;
   const asOf = cc.balanceAsOfDate || formatDateStr(new Date());
   const periodRate = getPeriodRate(cc.apr || 0, expense.frequency);
+  const dailyRate = getDailyRate(cc.apr || 0);
+  const method = resolveInterestMethod(cc.interestMethod, expense.category);
+  // Escrow / taxes / insurance leave the bank account but never touch the balance.
+  const escrow = Math.max(0, cc.escrowPortion || 0);
   const startBalance = Math.max(0, cc.currentBalance ?? cc.totalDebt ?? 0);
 
   const months = new Map<string, (number | null)[]>();
   const endBalances = new Map<string, number>();
+  const balanceAfter = new Map<string, number>();
+  // Daily compounding needs to know how long the money sat. The recorded balance
+  // is the starting point, so the first stretch runs from the as-of date.
+  let lastAccrual = asOf;
 
   const asOfDate = parseDate(asOf);
   let year = asOfDate.getFullYear();
@@ -660,15 +671,28 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
       if (occ.dateStr <= asOf) return occ.amount;
       if (balance <= 0.005) return null; // paid off before this payment came due
 
-      // Interest accrues even when a payment is skipped.
-      balance += balance * periodRate;
-      const payment = occ.isSkipped ? 0 : Math.min(occ.amount, balance);
-      balance -= payment;
+      // Interest accrues even when a payment is skipped. Daily compounding uses
+      // the real gap since the last payment, so a payment 3 days after the as-of
+      // date isn't charged a whole month of interest.
+      if (method === 'daily') {
+        balance *= Math.pow(1 + dailyRate, daysBetween(lastAccrual, occ.dateStr));
+      } else {
+        balance += balance * periodRate;
+      }
+      lastAccrual = occ.dateStr;
+
+      // Only what's left after escrow pays the balance down.
+      const principalDue = Math.max(0, occ.amount - escrow);
+      const principal = occ.isSkipped ? 0 : Math.min(principalDue, balance);
+      balance -= principal;
       if (balance <= 0.005) {
         balance = 0;
         paidOffDate = occ.dateStr;
       }
-      return payment;
+      balanceAfter.set(occ.dateStr, balance);
+      // What actually leaves the account: principal plus the escrow that rode
+      // along with it. Only the final payment differs from the full amount.
+      return occ.isSkipped ? 0 : principal + escrow;
     });
 
     months.set(key, adjusted);
@@ -686,6 +710,7 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
   return {
     months,
     endBalances,
+    balanceAfter,
     firstMonth,
     startBalance,
     paidOffDate,
@@ -914,6 +939,9 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   // Promoting a sandbox change into Reality is hard to undo, and the changes list
   // is scrolled by swiping right over the buttons — so it always confirms first.
   const [confirmPromote, setConfirmPromote] = useState<ScenarioChange | null>(null);
+  // An earlier version the user wants to correct. Held by id so the modal always
+  // reads the live item rather than a snapshot.
+  const [versionAction, setVersionAction] = useState<{ type: 'income' | 'expense'; versionId: string; successorId: string } | null>(null);
   const [pendingChange, setPendingChange] = useState<
     | { type: 'income'; id: string; name: string; data: Omit<Income, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
     | { type: 'expense'; id: string; name: string; data: Omit<Expense, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
@@ -1333,6 +1361,48 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     return items.flatMap(i => i.id === id
       ? [pruneOrphanedOverrides({ ...i, seriesId, endDate: lastDayOfOldVersion } as T), successor]
       : [i]);
+  };
+
+  // Fold an earlier version back into the one that replaced it: the later version's
+  // amounts take over its whole date range and the extra entry disappears. This is
+  // the repair for a version that shouldn't have been split off in the first place
+  // — no dates lose their payment, so nothing disappears from history.
+  const combineVersions = <T extends Income | Expense>(items: T[], versionId: string, successorId: string): T[] => {
+    const version = items.find(i => i.id === versionId);
+    const successor = items.find(i => i.id === successorId);
+    if (!version || !successor) return items;
+
+    const startDate = version.startDate || version.date || successor.startDate;
+    return items
+      .filter(i => i.id !== versionId)
+      .map(i => i.id === successorId
+        ? pruneOrphanedOverrides({
+            ...i,
+            startDate,
+            // Per-instance edits from both stretches survive wherever they still
+            // line up with a real occurrence; pruning drops the rest.
+            overrides: [...(version.overrides || []), ...(successor.overrides || [])]
+          } as T)
+        : i);
+  };
+
+  const applyVersionAction = (mode: 'combine' | 'delete') => {
+    if (!versionAction) return;
+    const { type, versionId, successorId } = versionAction;
+
+    if (type === 'income') {
+      const next = mode === 'combine'
+        ? combineVersions(budget.incomes, versionId, successorId)
+        : budget.incomes.filter(i => i.id !== versionId);
+      updateBudget({ incomes: next });
+    } else {
+      const next = mode === 'combine'
+        ? combineVersions(budget.expenses, versionId, successorId)
+        : budget.expenses.filter(e => e.id !== versionId);
+      updateBudget({ expenses: next });
+    }
+
+    setVersionAction(null);
   };
 
   // Would this edit rewrite history? If so, return what to ask the user.
@@ -1883,6 +1953,49 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     setExpandedSeries(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]);
 
   // "Was $1,650.00/mo until Aug 31, 2026"
+  // An item's history: every version of it, oldest first, in plain language. Prior
+  // versions are the amounts that were really in effect back then, so correcting
+  // one is funnelled through a confirm — a stray tap must not rewrite past months.
+  const renderItemHistory = (type: 'income' | 'expense', series: ItemSeries<Income | Expense>) => {
+    const priorCount = series.versions.length - 1;
+    if (priorCount < 1) return null;
+    const isExpanded = expandedSeries.includes(series.key);
+
+    return (
+      <div className="mt-1">
+        <button
+          onClick={() => toggleSeries(series.key)}
+          className="text-xs text-blue-400 hover:text-blue-300"
+        >
+          {isExpanded ? '▾' : '▸'} Amount changed {priorCount === 1 ? 'once' : `${priorCount} times`} — show history
+        </button>
+        {isExpanded && (
+          <div className="mt-1 space-y-1 border-l border-gray-700 pl-2">
+            {series.versions.map((version, i) => {
+              const isCurrent = i === series.versions.length - 1;
+              return (
+                <div key={version.id} className="flex items-center justify-between gap-2 text-xs">
+                  <span className={isCurrent ? 'text-gray-300' : 'text-gray-500'}>
+                    {versionSummary(version)}
+                    {isCurrent && <span className="text-green-400/80"> — current</span>}
+                  </span>
+                  {!isCurrent && (
+                    <button
+                      onClick={() => setVersionAction({ type, versionId: version.id, successorId: series.versions[i + 1].id })}
+                      className="text-blue-400/70 hover:text-blue-300 whitespace-nowrap"
+                    >
+                      Not right?
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const versionSummary = (item: Income | Expense) =>
     `${formatCurrency(item.amount)} ${frequencyLabels[item.frequency] || ''}`
     + (item.startDate || item.date ? ` from ${new Date((item.startDate || item.date)! + 'T12:00:00').toLocaleDateString()}` : '')
@@ -1924,24 +2037,14 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     // balance is all we know.
     if (dateStr <= (cc.balanceAsOfDate || '')) return schedule.startBalance;
 
-    const date = parseDate(dateStr);
-    const year = date.getFullYear();
-    const month = date.getMonth();
-    // Balance carried into this month, then walk the month's own payments up to
-    // the date, matching how buildBalanceSchedule amortizes each period.
-    const prev = month === 0 ? { year: year - 1, month: 11 } : { year, month: month - 1 };
-    let balance = getRemainingBalanceAtMonth(expense, prev.year, prev.month);
-    const periodRate = getPeriodRate(cc.apr || 0, expense.frequency);
-
-    getOccurrencesInMonth(expense, year, month)
-      .filter(occ => occ.dateStr <= dateStr && occ.dateStr > (cc.balanceAsOfDate || ''))
-      .forEach(occ => {
-        if (balance <= 0.005) return;
-        balance += balance * periodRate;
-        balance = Math.max(0, balance - (occ.isSkipped ? 0 : occ.amount));
-      });
-
-    return balance;
+    // The schedule already recorded the balance after every payment, so this is
+    // the most recent one on or before the date — no second amortization to keep
+    // in step with the first.
+    let latestDate = '';
+    schedule.balanceAfter.forEach((_, occDate) => {
+      if (occDate <= dateStr && occDate > latestDate) latestDate = occDate;
+    });
+    return latestDate ? Math.max(0, schedule.balanceAfter.get(latestDate)!) : schedule.startBalance;
   };
 
   const handleEditEvent = (event: DayEvent) => {
@@ -1995,6 +2098,21 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   };
 
   if (loading) return <div className="min-h-screen bg-gray-950 flex items-center justify-center"><div className="text-gray-400">Loading...</div></div>;
+
+  // The live pair behind the "earlier amount" dialog, plus what each option costs.
+  const versionDetail = (() => {
+    if (!versionAction) return null;
+    const items: (Income | Expense)[] = versionAction.type === 'income' ? budget.incomes : budget.expenses;
+    const version = items.find(i => i.id === versionAction.versionId);
+    const successor = items.find(i => i.id === versionAction.successorId);
+    if (!version || !successor) return null;
+    return {
+      version,
+      successor,
+      pastCount: countPastOccurrences(version),
+      tracksBalance: !!(version as Expense).creditCard || !!(successor as Expense).creditCard
+    };
+  })();
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
@@ -2451,8 +2569,6 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                     {/* Regular Income Items */}
                     {incomeSeries.map(series => {
                       const income = series.current;
-                      const priorVersions = series.versions.slice(0, -1);
-                      const isExpanded = expandedSeries.includes(series.key);
                       return (
                       <div key={series.key} className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 border rounded-lg ${income.endDate ? 'bg-gray-800/50 border-gray-700/50' : 'bg-gray-800 border-gray-700'}`}>
                         <div className="flex-1 min-w-0">
@@ -2477,32 +2593,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                           </div>
 
                           {/* Earlier versions — e.g. what you earned before the raise */}
-                          {priorVersions.length > 0 && (
-                            <div className="mt-1">
-                              <button
-                                onClick={() => toggleSeries(series.key)}
-                                className="text-xs text-blue-400 hover:text-blue-300"
-                              >
-                                {isExpanded ? '▾' : '▸'} {series.versions.length} versions
-                              </button>
-                              {isExpanded && (
-                                <div className="mt-1 space-y-1 border-l border-gray-700 pl-2">
-                                  {priorVersions.map(version => (
-                                    <div key={version.id} className="flex items-center justify-between gap-2 text-xs text-gray-500">
-                                      <span>{versionSummary(version)}</span>
-                                      <button
-                                        onClick={() => updateBudget({ incomes: budget.incomes.filter(i => i.id !== version.id) })}
-                                        className="text-red-400/60 hover:text-red-400"
-                                        title="Delete this version (removes its history)"
-                                      >
-                                        ×
-                                      </button>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          )}
+                          {renderItemHistory('income', series)}
                         </div>
                         <div className="flex items-center justify-between sm:justify-end gap-2">
                           <div className="font-mono text-emerald-400 font-semibold text-lg">{formatCurrency(income.amount)}</div>
@@ -2690,8 +2781,6 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                         <div className="space-y-2">
                           {items.map(series => {
                             const expense = series.current;
-                            const priorVersions = series.versions.slice(0, -1);
-                            const isExpanded = expandedSeries.includes(series.key);
                             const ccBalance = expense.creditCard ? getTrackedBalance(expense) : null;
                             const catColor = getCategoryColor(expense.category, data.categoryColors);
                             const isPaidOff = ccBalance?.isPaidOff;
@@ -2756,32 +2845,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                 </div>
 
                                 {/* Earlier versions of this expense, kept so history stays true */}
-                                {priorVersions.length > 0 && (
-                                  <div className="ml-4 mt-1">
-                                    <button
-                                      onClick={() => toggleSeries(series.key)}
-                                      className="text-xs text-blue-400 hover:text-blue-300"
-                                    >
-                                      {isExpanded ? '▾' : '▸'} {series.versions.length} versions
-                                    </button>
-                                    {isExpanded && (
-                                      <div className="mt-1 space-y-1 border-l border-gray-700 pl-2">
-                                        {priorVersions.map(version => (
-                                          <div key={version.id} className="flex items-center justify-between gap-2 text-xs text-gray-500">
-                                            <span>{versionSummary(version)}</span>
-                                            <button
-                                              onClick={() => updateBudget({ expenses: budget.expenses.filter(e => e.id !== version.id) })}
-                                              className="text-red-400/60 hover:text-red-400"
-                                              title="Delete this version (removes its history)"
-                                            >
-                                              ×
-                                            </button>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    )}
-                                  </div>
-                                )}
+                                <div className="ml-4">{renderItemHistory('expense', series)}</div>
                                 {isPaidOff && (
                                   <div className="mt-2 ml-4 flex flex-wrap items-center gap-2 p-2 bg-green-500/10 border border-green-500/20 rounded-lg">
                                     <span className="text-xs text-green-300">Balance cleared — adjust or remove this expense?</span>
@@ -3314,6 +3378,64 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
           <div className="flex justify-between items-center gap-3 p-4 border-t border-gray-800">
             <div className="text-xs text-gray-500">&quot;Make real&quot; applies one change to Reality and leaves the sandbox as-is.</div>
             <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Correcting an earlier version. Combining is the safe repair for a version
+          that shouldn't exist; deleting drops those months' payments outright. */}
+      {versionDetail && (
+        <Modal title={`Earlier amount for ${versionDetail.version.name}`} onClose={() => setVersionAction(null)}>
+          <div className="p-4 space-y-4">
+            <div className="p-3 bg-gray-800 rounded-lg space-y-1 text-sm">
+              <div className="text-xs text-gray-500 uppercase">This period</div>
+              <div className="font-mono text-yellow-400">{versionSummary(versionDetail.version)}</div>
+              <div className="text-xs text-gray-500 uppercase pt-2">Replaced by</div>
+              <div className="font-mono text-green-400">{versionSummary(versionDetail.successor)}</div>
+            </div>
+
+            <div className="text-sm text-gray-400">
+              These are the amounts that were really in effect back then, so both options below
+              change what past months look like.
+            </div>
+
+            <button
+              type="button"
+              onClick={() => applyVersionAction('combine')}
+              className="w-full text-left p-3 bg-blue-600/10 hover:bg-blue-600/20 border border-blue-500/40 rounded-lg"
+            >
+              <div className="font-medium text-blue-300">It was always the newer amount</div>
+              <div className="text-xs text-gray-400 mt-1">
+                Extends {formatCurrency(versionDetail.successor.amount)} back over this period and removes
+                the extra entry. Every date keeps a payment — nothing vanishes from the calendar. Use this
+                if the split was created by mistake.
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => applyVersionAction('delete')}
+              className="w-full text-left p-3 bg-red-500/5 hover:bg-red-500/10 border border-red-500/30 rounded-lg"
+            >
+              <div className="font-medium text-red-300">This period never happened</div>
+              <div className="text-xs text-gray-400 mt-1">
+                Deletes it, removing {versionDetail.pastCount === 1 ? 'its 1 past payment' : `all ${versionDetail.pastCount} of its past payments`} from
+                the projection. Balances in those months change.
+                {versionDetail.tracksBalance && ' This expense tracks a balance, so its payoff projection shifts too.'}
+              </div>
+            </button>
+
+            <div className="text-xs text-gray-500">
+              {activeScenario
+                ? `Only affects the ${activeScenario.name} sandbox — Reality is untouched.`
+                : 'This changes your real budget, not a sandbox.'}
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
+            <button type="button" onClick={() => setVersionAction(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">
+              Leave it alone
+            </button>
           </div>
         </Modal>
       )}

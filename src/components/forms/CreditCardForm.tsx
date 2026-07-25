@@ -2,6 +2,7 @@
 
 import { useState, useMemo } from 'react';
 import { Expense } from '@/lib/types';
+import { projectPayoff, resolveInterestMethod } from '@/lib/payoff';
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 
@@ -30,60 +31,18 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
   const startDateStr = `${form.startMonth}-${String(form.dayOfMonth).padStart(2, '0')}`;
   const endBeforeStart = endDate !== '' && endDate < startDateStr;
 
-  // Calculate payoff details
+  // Payoff outlook, from the same engine the projection uses — a card compounds
+  // daily unless the balance dialog says otherwise, so a local monthly loop here
+  // would quietly disagree with the numbers on the dashboard.
   const payoffCalc = useMemo(() => {
-    if (!form.amount || !form.currentBalance) return null;
-    
     const payment = parseFloat(form.amount);
     const debt = parseFloat(form.currentBalance);
-    const apr = parseFloat(form.apr) || 0;
-    const monthlyRate = (apr / 100) / 12;
-    
-    if (payment <= 0 || debt <= 0) return null;
-    
-    // Simple payoff without interest
-    if (apr === 0) {
-      const months = Math.ceil(debt / payment);
-      const totalPaid = payment * months;
-      return {
-        months,
-        totalPaid,
-        totalInterest: 0,
-        lastPayment: debt % payment || payment
-      };
-    }
-    
-    // Payoff with interest
-    let remaining = debt;
-    let months = 0;
-    let totalPaid = 0;
-    
-    // Check if payment covers at least the monthly interest
-    const monthlyInterest = remaining * monthlyRate;
-    if (payment <= monthlyInterest) {
-      return { months: -1, totalPaid: 0, totalInterest: 0, lastPayment: 0 }; // Will never pay off
-    }
-    
-    while (remaining > 0.01 && months < 600) {
-      const interest = remaining * monthlyRate;
-      remaining = remaining + interest - payment;
-      totalPaid += payment;
-      months++;
-      
-      if (remaining < 0) {
-        // Final payment was less than full payment
-        totalPaid += remaining; // Subtract the overpayment
-        remaining = 0;
-      }
-    }
-    
-    return {
-      months,
-      totalPaid,
-      totalInterest: totalPaid - debt,
-      lastPayment: payment + (remaining < 0 ? remaining : 0)
-    };
-  }, [form.amount, form.currentBalance, form.apr]);
+    if (!(payment > 0) || !(debt > 0)) return null;
+    return projectPayoff(debt, [payment], parseFloat(form.apr) || 0, 'monthly', {
+      method: resolveInterestMethod(expense?.creditCard?.interestMethod, 'credit_card'),
+      escrow: expense?.creditCard?.escrowPortion
+    });
+  }, [form.amount, form.currentBalance, form.apr, expense]);
 
   const handleSave = () => {
     if (!form.name || !form.amount || !form.currentBalance) return;
@@ -102,7 +61,11 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
         currentBalance: currentBalance,
         balanceAsOfDate: form.balanceAsOfDate,
         apr: parseFloat(form.apr) || 0,
-        minimumPayment: parseFloat(form.minimumPayment || form.amount)
+        minimumPayment: parseFloat(form.minimumPayment || form.amount),
+        // Set in the balance dialog, not here — carry them through so saving this
+        // form doesn't silently reset how interest accrues or drop the escrow split.
+        interestMethod: expense?.creditCard?.interestMethod,
+        escrowPortion: expense?.creditCard?.escrowPortion
       }
     });
   };

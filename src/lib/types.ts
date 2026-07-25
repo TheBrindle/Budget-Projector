@@ -60,6 +60,15 @@ export interface CreditCard {
   balanceAsOfDate: string; // YYYY-MM-DD - date the currentBalance was recorded
   apr: number;
   minimumPayment: number;
+  // How interest is applied. Credit cards compound daily on the balance, so the
+  // gap between payments matters; mortgages and most loans accrue once per
+  // scheduled payment on the outstanding principal. Absent = decided by category
+  // (see resolveInterestMethod), so data saved before this existed still works.
+  interestMethod?: 'daily' | 'periodic';
+  // The slice of each payment that never reaches the balance — escrow, property
+  // tax, insurance, PMI. Cash flow still shows the whole payment; only the
+  // balance is drawn down by the remainder. Absent or 0 = all principal.
+  escrowPortion?: number;
 }
 
 export interface PaymentPlan {

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import { Expense, SplitConfig } from '@/lib/types';
-import { projectPayoff, paymentCadenceLabel } from '@/lib/payoff';
+import { projectPayoff, paymentCadenceLabel, resolveInterestMethod } from '@/lib/payoff';
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 
@@ -73,8 +73,13 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
     // Split monthly pays two different amounts per month; everything else pays
     // the same amount every period.
     const cycle = form.frequency === 'split' ? [first, second] : [parseFloat(form.amount)];
-    return projectPayoff(debt, cycle, parseFloat(apr) || 0, form.frequency);
-  }, [form.amount, form.frequency, first, second, currentBalance, apr]);
+    // Match the projection: accrual model and escrow split live on the saved
+    // balance, and are edited in the balance dialog rather than here.
+    return projectPayoff(debt, cycle, parseFloat(apr) || 0, form.frequency, {
+      method: resolveInterestMethod(expense?.creditCard?.interestMethod, form.category),
+      escrow: expense?.creditCard?.escrowPortion
+    });
+  }, [form.amount, form.frequency, form.category, first, second, currentBalance, apr, expense]);
 
   // Auto-set first amount to half when switching to split or when amount changes
   useEffect(() => {
@@ -117,7 +122,11 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
         currentBalance: balance,
         balanceAsOfDate,
         apr: parseFloat(apr) || 0,
-        minimumPayment: parseFloat(form.amount)
+        minimumPayment: parseFloat(form.amount),
+        // Set in the balance dialog, not here — carry them through so saving this
+        // form doesn't silently reset how interest accrues or drop the escrow split.
+        interestMethod: expense?.creditCard?.interestMethod,
+        escrowPortion: expense?.creditCard?.escrowPortion
       };
     } else {
       expenseData.creditCard = undefined;

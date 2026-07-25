@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { CreditCard, Expense } from '@/lib/types';
-import { projectPayoff, paymentCadenceLabel, getPeriodRate } from '@/lib/payoff';
+import { projectPayoff, paymentCadenceLabel, getPeriodRate, getDailyRate, resolveInterestMethod, InterestMethod } from '@/lib/payoff';
 
 const formatCurrency = (amount: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
 
@@ -28,6 +28,10 @@ export default function BalanceUpdateForm({ expense, projectedBalance, onSave, o
 
   const [balance, setBalance] = useState(cc?.currentBalance?.toString() ?? '');
   const [apr, setApr] = useState(cc?.apr?.toString() ?? '0');
+  const [method, setMethod] = useState<InterestMethod>(
+    resolveInterestMethod(cc?.interestMethod, expense.category)
+  );
+  const [escrow, setEscrow] = useState(cc?.escrowPortion?.toString() ?? '');
   const [asOfDate, setAsOfDate] = useState(() => {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -43,12 +47,20 @@ export default function BalanceUpdateForm({ expense, projectedBalance, onSave, o
     ? [expense.splitConfig.firstAmount, expense.splitConfig.secondAmount]
     : [expense.amount];
   const aprValue = parseFloat(apr) || 0;
-  const payoff = isValid ? projectPayoff(parsed, cycle, aprValue, expense.frequency) : null;
+  const escrowValue = Math.max(0, parseFloat(escrow) || 0);
+  const payoff = isValid
+    ? projectPayoff(parsed, cycle, aprValue, expense.frequency, { method, escrow: escrowValue })
+    : null;
 
   // Interest this balance accrues per payment period, so a rate can be sanity
   // checked against the payment before saving it.
-  const periodInterest = isValid ? parsed * getPeriodRate(aprValue, expense.frequency) : 0;
+  const periodInterest = !isValid ? 0 : method === 'daily'
+    ? parsed * (Math.pow(1 + getDailyRate(aprValue), 365 / 12) - 1)
+    : parsed * getPeriodRate(aprValue, expense.frequency);
   const aprChanged = !isNew && aprValue !== (cc?.apr ?? 0);
+  // What actually reduces the balance each payment.
+  const principalPortion = Math.max(0, expense.amount - escrowValue);
+  const escrowEatsPayment = escrowValue > 0 && principalPortion <= 0;
 
   const handleSave = () => {
     if (!isValid) return;
@@ -59,7 +71,9 @@ export default function BalanceUpdateForm({ expense, projectedBalance, onSave, o
       currentBalance: parsed,
       balanceAsOfDate: asOfDate,
       apr: parseFloat(apr) || 0,
-      minimumPayment: cc?.minimumPayment ?? expense.amount
+      minimumPayment: cc?.minimumPayment ?? expense.amount,
+      interestMethod: method,
+      escrowPortion: escrowValue > 0 ? escrowValue : undefined
     });
   };
 
@@ -128,6 +142,65 @@ export default function BalanceUpdateForm({ expense, projectedBalance, onSave, o
           )}
         </div>
 
+        {/* How the lender applies that rate. Wrong choice here is worth real money
+            over a long balance, so it's an explicit pick rather than a guess. */}
+        {aprValue > 0 && (
+          <div>
+            <label className="text-xs text-gray-500 uppercase block mb-1">How interest is charged</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setMethod('daily')}
+                className={`p-2 rounded-lg border text-left ${method === 'daily' ? 'bg-purple-500/20 border-purple-500/50' : 'bg-gray-800 border-gray-700'}`}
+              >
+                <div className="text-sm font-medium">Daily</div>
+                <div className="text-xs text-gray-400">Credit cards. Compounds every day.</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setMethod('periodic')}
+                className={`p-2 rounded-lg border text-left ${method === 'periodic' ? 'bg-purple-500/20 border-purple-500/50' : 'bg-gray-800 border-gray-700'}`}
+              >
+                <div className="text-sm font-medium">Per payment</div>
+                <div className="text-xs text-gray-400">Mortgages, most loans.</div>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Escrow: money that leaves the account without touching the balance. */}
+        <div>
+          <label className="text-xs text-gray-500 uppercase block mb-1">
+            Escrow / taxes / insurance per payment (optional)
+          </label>
+          <input
+            type="number"
+            value={escrow}
+            onChange={e => setEscrow(e.target.value)}
+            className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white font-mono"
+            placeholder="0.00"
+            step="0.01"
+            min="0"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            {escrowValue > 0 ? (
+              <>
+                Of the {formatCurrency(expense.amount)} payment,{' '}
+                <span className="font-mono text-purple-300">{formatCurrency(principalPortion)}</span> pays the
+                balance down and {formatCurrency(escrowValue)} does not. Your cash flow still shows the full
+                payment.
+              </>
+            ) : (
+              'For a mortgage, the part of the payment that is taxes and insurance rather than principal — otherwise the payoff date reads early.'
+            )}
+          </p>
+          {escrowEatsPayment && (
+            <p className="text-xs text-red-400 mt-1">
+              That leaves nothing to pay the balance down. Lower it below {formatCurrency(expense.amount)}.
+            </p>
+          )}
+        </div>
+
         {!isNew && (
           <div className="p-3 bg-gray-800 rounded-lg space-y-1 text-sm">
             <div className="flex justify-between">
@@ -176,6 +249,11 @@ export default function BalanceUpdateForm({ expense, projectedBalance, onSave, o
                   {payoff.totalInterest > 0 && (
                     <div className="text-xs text-purple-400/70">incl. {formatCurrency(payoff.totalInterest)} interest</div>
                   )}
+                  {escrowValue > 0 && (
+                    <div className="text-xs text-purple-400/70">
+                      and {formatCurrency(escrowValue * payoff.periods)} escrow
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -204,7 +282,7 @@ export default function BalanceUpdateForm({ expense, projectedBalance, onSave, o
         <button
           type="button"
           onClick={handleSave}
-          disabled={!isValid}
+          disabled={!isValid || escrowEatsPayment}
           className="px-4 py-2 bg-purple-600 text-white rounded-lg font-medium disabled:opacity-50"
         >
           {isNew ? 'Track Balance' : 'Update Balance'}
