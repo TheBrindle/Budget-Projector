@@ -104,8 +104,9 @@ export interface BalanceCheckpoint {
   note?: string;
 }
 
-// A sandbox fork of the budget. Only incomes and expenses are copied — the
-// starting balance and recorded checkpoints are facts about reality, so every
+// A sandbox fork of Reality — always Reality, never another sandbox, so scenarios
+// stay independent alternatives rather than a chain. Only incomes and expenses are
+// copied: the starting balance and recorded checkpoints are facts, so every
 // scenario branches from the same factual starting point.
 export interface Scenario {
   id: string;

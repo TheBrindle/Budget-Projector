@@ -1083,7 +1083,10 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     }
   };
 
-  // Fork the budget you're currently looking at into a new sandbox
+  // Fork a new sandbox from Reality — always Reality, even when you're already
+  // inside one. Sandboxes are alternatives to what's true, not to each other, so
+  // starting a new one can't inherit another sandbox's edits; otherwise every diff
+  // and comparison would be measured against changes you didn't make here.
   const createScenario = (name: string) => {
     const id = Date.now().toString();
     const copy = <T,>(items: T[]): T[] => JSON.parse(JSON.stringify(items));
@@ -1092,8 +1095,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         id,
         name: name.trim() || 'Untitled scenario',
         createdAt: formatDateStr(new Date()),
-        incomes: copy(budget.incomes),
-        expenses: copy(budget.expenses)
+        incomes: copy(data.incomes),
+        expenses: copy(data.expenses)
       }]
     });
     setActiveScenarioId(id);
@@ -3513,8 +3516,14 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
         <Modal title="New Scenario" onClose={() => setModal(null)}>
           <div className="p-4 space-y-3">
             <div className="text-sm text-gray-300">
-              Forks {activeScenario ? `"${activeScenario.name}"` : 'Reality'} into a sandbox you can change freely. Your real budget stays untouched.
+              Forks Reality into a sandbox you can change freely. Your real budget stays untouched.
             </div>
+            {activeScenario && (
+              <div className="text-xs text-purple-300/80">
+                Starts from Reality, not from &quot;{activeScenario.name}&quot; — the changes you made there
+                won&apos;t come with it.
+              </div>
+            )}
             <div>
               <label className="text-xs text-gray-500 uppercase block mb-1">Name</label>
               <input
