@@ -1890,16 +1890,16 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
   // Remaining balance and payoff outlook for any balance-tracked expense,
   // as of the month currently being viewed.
-  const getTrackedBalance = (expense: Expense): { remaining: number; isPaidOff: boolean; monthsRemaining: number; payoffDate: string | null } => {
-    if (!expense.creditCard) return { remaining: 0, isPaidOff: true, monthsRemaining: 0, payoffDate: null };
+  const getTrackedBalance = (expense: Expense): { remaining: number; isPaidOff: boolean; monthsRemaining: number; payoffDate: string | null; neverPaysOff: boolean } => {
+    if (!expense.creditCard) return { remaining: 0, isPaidOff: true, monthsRemaining: 0, payoffDate: null, neverPaysOff: false };
 
     const { year, month } = selectedMonth;
     const schedule = getBalanceSchedule(expense);
     const remaining = getRemainingBalanceAtMonth(expense, year, month);
 
-    if (remaining <= 0.005) return { remaining: 0, isPaidOff: true, monthsRemaining: 0, payoffDate: null };
+    if (remaining <= 0.005) return { remaining: 0, isPaidOff: true, monthsRemaining: 0, payoffDate: null, neverPaysOff: false };
     if (schedule.neverPaysOff || !schedule.paidOffDate) {
-      return { remaining, isPaidOff: false, monthsRemaining: 0, payoffDate: 'Never (payment too low)' };
+      return { remaining, isPaidOff: false, monthsRemaining: 0, payoffDate: 'none at this payment', neverPaysOff: true };
     }
 
     const payoff = parseDate(schedule.paidOffDate);
@@ -1908,7 +1908,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       remaining,
       isPaidOff: false,
       monthsRemaining,
-      payoffDate: payoff.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+      payoffDate: payoff.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+      neverPaysOff: false
     };
   };
 
@@ -2719,11 +2720,14 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                     ) : (
                                       <>
                                         <span className={catColor.text}> • Balance: {formatCurrency(ccBalance?.remaining || 0)}</span>
-                                        {ccBalance?.monthsRemaining && ccBalance.monthsRemaining > 0 && (
+                                        {/* `x && …` on a number renders a literal 0 when x is 0 */}
+                                        {!!ccBalance?.monthsRemaining && ccBalance.monthsRemaining > 0 && (
                                           <span className="text-gray-400"> • {ccBalance.monthsRemaining} mo left</span>
                                         )}
                                         {ccBalance?.payoffDate && (
-                                          <span className="text-gray-500"> (payoff: {ccBalance.payoffDate})</span>
+                                          ccBalance.neverPaysOff
+                                            ? <span className="text-yellow-500/80"> • no payoff date at this payment</span>
+                                            : <span className="text-gray-500"> (payoff: {ccBalance.payoffDate})</span>
                                         )}
                                       </>
                                     )
@@ -2801,13 +2805,18 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                               <div className="flex items-center justify-between sm:justify-end gap-2">
                                 <div className={`font-mono font-semibold text-lg ${isPaidOff ? 'text-green-400' : catColor.text}`}>{formatCurrency(expense.amount)}/mo</div>
                                 <div className="flex gap-2">
-                                  {expense.creditCard && (
+                                  {/* Any recurring expense can carry a balance — a mortgage, a
+                                      business card, a loan. Payment plans already model their own
+                                      debt, and a one-time expense has nothing to pay down. */}
+                                  {expense.frequency !== 'once' && expense.frequency !== 'payment_plan' && (
                                     <button
                                       onClick={() => { setEditingItem(expense); setModal('update-balance'); }}
-                                      className="px-3 py-1.5 bg-purple-500/15 text-purple-300 rounded text-sm whitespace-nowrap"
-                                      title="Record the current balance without changing the payment schedule"
+                                      className={`px-3 py-1.5 rounded text-sm whitespace-nowrap ${expense.creditCard ? 'bg-purple-500/15 text-purple-300' : 'bg-gray-700/50 text-gray-400'}`}
+                                      title={expense.creditCard
+                                        ? 'Record the current balance without changing the payment schedule'
+                                        : 'Track what\'s still owed on this expense'}
                                     >
-                                      Balance
+                                      {expense.creditCard ? 'Balance' : '+ Balance'}
                                     </button>
                                   )}
                                   <button onClick={openEditor} className="px-3 py-1.5 bg-gray-700 text-gray-300 rounded text-sm">Edit</button>
@@ -3133,13 +3142,17 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
           />
         </Modal>
       )}
-      {/* Re-record a real balance. Applies in place — never forks a new version. */}
-      {modal === 'update-balance' && editingItem && (editingItem as Expense).creditCard && (
-        <Modal title={`Update ${editingItem.name} Balance`} onClose={() => { setModal(null); setEditingItem(null); }}>
+      {/* Attach or re-record a real balance. Applies in place — never forks a version. */}
+      {modal === 'update-balance' && editingItem && (
+        <Modal
+          title={(editingItem as Expense).creditCard ? `Update ${editingItem.name} Balance` : `Track ${editingItem.name} Balance`}
+          onClose={() => { setModal(null); setEditingItem(null); }}
+        >
           <BalanceUpdateForm
             expense={editingItem as Expense}
             projectedBalance={(asOfDate) => getProjectedBalanceOnDate(editingItem as Expense, asOfDate)}
             onSave={(creditCard: CreditCard) => updateExpense(editingItem.id, { creditCard })}
+            onStopTracking={() => updateExpense(editingItem.id, { creditCard: undefined })}
             onClose={() => { setModal(null); setEditingItem(null); }}
           />
         </Modal>

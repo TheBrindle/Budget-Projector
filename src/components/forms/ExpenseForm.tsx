@@ -343,11 +343,17 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
                 </div>
 
                 {payoffCalc && (
-                  <div className={`p-3 rounded-lg border ${payoffCalc.months < 0 ? 'bg-red-500/10 border-red-500/30' : 'bg-purple-500/10 border-purple-500/30'}`}>
+                  <div className={`p-3 rounded-lg border ${payoffCalc.months < 0 ? 'bg-yellow-500/10 border-yellow-500/30' : 'bg-purple-500/10 border-purple-500/30'}`}>
                     {payoffCalc.months < 0 ? (
-                      <div className="text-red-400 text-sm">
-                        <div className="font-semibold">Payment too low</div>
-                        <div className="text-xs opacity-75">Each payment must exceed the interest charge to pay this off.</div>
+                      // Not an error. A mortgage-sized balance can outlive the 50-year
+                      // horizon at a realistic payment, and it's still worth tracking —
+                      // so this warns instead of blocking the save.
+                      <div className="text-yellow-300 text-sm">
+                        <div className="font-semibold">No payoff date in the next 50 years</div>
+                        <div className="text-xs text-yellow-400/70 mt-1">
+                          At this payment the interest eats most of each payment. The balance still gets
+                          tracked and drawn down — there&apos;s just no payoff date to show.
+                        </div>
                       </div>
                     ) : (
                       <>
@@ -381,7 +387,7 @@ export default function ExpenseForm({ expense, onSave, onClose, defaultMonth }: 
         <button 
           type="button" 
           onClick={handleSave} 
-          disabled={!form.name || !form.amount || endBeforeStart || (form.frequency === 'split' && second < 0) || (trackBalance && (!currentBalance || (payoffCalc?.months ?? 0) <= 0))}
+          disabled={!form.name || !form.amount || endBeforeStart || (form.frequency === 'split' && second < 0) || (trackBalance && !(parseFloat(currentBalance) > 0))}
           className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium disabled:opacity-50"
         >
           Save

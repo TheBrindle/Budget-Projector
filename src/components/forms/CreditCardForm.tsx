@@ -107,7 +107,9 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
     });
   };
 
-  const isValid = form.name && form.amount && form.currentBalance && payoffCalc && payoffCalc.months > 0 && !endBeforeStart;
+  // A card whose payment barely covers the interest still needs to be tracked —
+  // that's exactly the situation worth seeing in a projection. Warn, don't block.
+  const isValid = form.name && form.amount && parseFloat(form.currentBalance) > 0 && !endBeforeStart;
 
   const dayOptions = Array.from({ length: 31 }, (_, i) => i + 1);
   
@@ -265,11 +267,14 @@ export default function CreditCardForm({ expense, onSave, onClose, defaultMonth 
         </div>
 
         {payoffCalc && (
-          <div className={`p-4 rounded-lg border ${payoffCalc.months < 0 ? 'bg-red-500/10 border-red-500/30' : 'bg-purple-500/10 border-purple-500/30'}`}>
+          <div className={`p-4 rounded-lg border ${payoffCalc.months < 0 ? 'bg-yellow-500/10 border-yellow-500/30' : 'bg-purple-500/10 border-purple-500/30'}`}>
             {payoffCalc.months < 0 ? (
-              <div className="text-red-400">
-                <div className="font-semibold">Payment too low</div>
-                <div className="text-xs opacity-75">Monthly payment must exceed the interest charge to pay off the balance</div>
+              <div className="text-yellow-300">
+                <div className="font-semibold">Payment doesn&apos;t cover the interest</div>
+                <div className="text-xs text-yellow-400/70 mt-1">
+                  The balance will grow instead of shrink. You can still save this — the projection
+                  will show the payment every month with no payoff date.
+                </div>
               </div>
             ) : (
               <>
