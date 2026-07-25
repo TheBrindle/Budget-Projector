@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
 import { CashFlowData, CreditCard, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
 import { getPeriodRate, getDailyRate, daysBetween, resolveInterestMethod } from '@/lib/payoff';
+import { summarizeDebt, summarizePortfolio, withExtraPayment, compareTargets, ExtraPaymentMode } from '@/lib/debt';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
 import OneTimeIncomeForm from './forms/OneTimeIncomeForm';
@@ -614,15 +615,26 @@ const getRawOccurrencesInMonth = (item: Income | Expense, year: number, month: n
 // payment shrinks to whatever is left, and payments stop once it hits $0.
 // ---------------------------------------------------------------------------
 
+// One amortized payment: what left the account, and how it split.
+interface LedgerEntry {
+  date: string; // YYYY-MM-DD
+  payment: number; // cash out of pocket, escrow included
+  interest: number; // interest charged for the period ending on this date
+  principal: number; // the part that reduced the balance
+  balanceAfter: number;
+}
+
 interface BalanceSchedule {
   // 'YYYY-MM' -> amount actually paid for each raw occurrence that month.
   // null means the occurrence falls after payoff and should be dropped.
   months: Map<string, (number | null)[]>;
   // 'YYYY-MM' -> balance remaining at the end of that month
   endBalances: Map<string, number>;
-  // 'YYYY-MM-DD' -> balance immediately after that date's payment. Lets any date
-  // be answered without re-running the amortization.
-  balanceAfter: Map<string, number>;
+  // Every payment the projection actually amortizes, oldest first — anything on or
+  // before the as-of date is history and stays out. One ordered ledger answers
+  // "balance on date X", "interest still to come" and "how many payments left"
+  // without anyone re-deriving the amortization.
+  ledger: LedgerEntry[];
   firstMonth: string; // month containing balanceAsOfDate; nothing before it is touched
   startBalance: number;
   paidOffDate: string | null; // date of the payment that cleared the balance
@@ -647,7 +659,7 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
 
   const months = new Map<string, (number | null)[]>();
   const endBalances = new Map<string, number>();
-  const balanceAfter = new Map<string, number>();
+  const ledger: LedgerEntry[] = [];
   // Daily compounding needs to know how long the money sat. The recorded balance
   // is the starting point, so the first stretch runs from the as-of date.
   let lastAccrual = asOf;
@@ -674,11 +686,13 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
       // Interest accrues even when a payment is skipped. Daily compounding uses
       // the real gap since the last payment, so a payment 3 days after the as-of
       // date isn't charged a whole month of interest.
+      const before = balance;
       if (method === 'daily') {
         balance *= Math.pow(1 + dailyRate, daysBetween(lastAccrual, occ.dateStr));
       } else {
         balance += balance * periodRate;
       }
+      const interest = balance - before;
       lastAccrual = occ.dateStr;
 
       // Only what's left after escrow pays the balance down.
@@ -689,10 +703,11 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
         balance = 0;
         paidOffDate = occ.dateStr;
       }
-      balanceAfter.set(occ.dateStr, balance);
       // What actually leaves the account: principal plus the escrow that rode
       // along with it. Only the final payment differs from the full amount.
-      return occ.isSkipped ? 0 : principal + escrow;
+      const payment = occ.isSkipped ? 0 : principal + escrow;
+      ledger.push({ date: occ.dateStr, payment, interest, principal, balanceAfter: balance });
+      return payment;
     });
 
     months.set(key, adjusted);
@@ -710,7 +725,7 @@ const buildBalanceSchedule = (expense: Expense): BalanceSchedule => {
   return {
     months,
     endBalances,
-    balanceAfter,
+    ledger,
     firstMonth,
     startBalance,
     paidOffDate,
@@ -947,6 +962,13 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     | { type: 'expense'; id: string; name: string; data: Omit<Expense, 'id'>; changes: string[]; pastCount: number; orphanedOverrides: number; effectiveFrom: string }
     | null
   >(null);
+  // Spare money looking for a home: how much, from when, and whether it's a
+  // one-off or a permanent raise to the payment.
+  const [extraPayment, setExtraPayment] = useState(() => ({
+    amount: '',
+    date: formatDateStr(new Date()),
+    mode: 'once' as ExtraPaymentMode
+  }));
   // formatDateStr is local-time; toISOString would hand back tomorrow's date
   // for anyone east of UTC in the evening.
   const [newCheckpoint, setNewCheckpoint] = useState(() => ({
@@ -1683,7 +1705,10 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       days.push({ day, events, change: dayChange, balance: runningBalance });
     }
     return days;
-  }, [data, selectedMonth]);
+    // budget.* must be listed: switching between Reality and a sandbox changes
+    // only activeScenarioId, so a memo keyed on `data` alone would keep drawing
+    // the previous budget's days under the new budget's name.
+  }, [budget.incomes, budget.expenses, data, selectedMonth]);
 
   const stats = useMemo(() => {
     const lowestDay = dailyData.reduce((min, d) => d.balance < min.balance ? d : min, dailyData[0] || { balance: 0, day: 1 });
@@ -1739,7 +1764,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     }
     
     return balance;
-  }, [data]);
+    // See dailyData: the active budget has to be a dependency, not just `data`.
+  }, [budget.incomes, budget.expenses, data]);
 
   // Balance the projection expects at the start of targetDate, running forward
   // from a given anchor and ignoring anything recorded after it.
@@ -1787,7 +1813,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       const drift = checkpoint.actualBalance - predicted;
       return { ...checkpoint, predicted, drift, anchorDate: anchor.date, days, driftPerMonth: (drift / days) * 30.44 };
     });
-  }, [data, balanceAnchors]);
+    // projectBalanceAt walks the active budget, so that has to be a dependency too.
+  }, [budget.incomes, budget.expenses, data, balanceAnchors]);
 
   // What the drift says about the budget as a whole.
   const driftInsight = useMemo(() => {
@@ -2037,14 +2064,161 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     // balance is all we know.
     if (dateStr <= (cc.balanceAsOfDate || '')) return schedule.startBalance;
 
-    // The schedule already recorded the balance after every payment, so this is
-    // the most recent one on or before the date — no second amortization to keep
-    // in step with the first.
-    let latestDate = '';
-    schedule.balanceAfter.forEach((_, occDate) => {
-      if (occDate <= dateStr && occDate > latestDate) latestDate = occDate;
+    // The ledger already recorded the balance after every payment, in order, so
+    // this is the last entry on or before the date — no second amortization to
+    // keep in step with the first.
+    let result = schedule.startBalance;
+    for (const entry of schedule.ledger) {
+      if (entry.date > dateStr) break;
+      result = entry.balanceAfter;
+    }
+    return Math.max(0, result);
+  };
+
+  // Every debt in the budget on screen, and what it costs from here.
+  const debtExpenses = useMemo(
+    () => budget.expenses.filter(e => !!e.creditCard && e.frequency !== 'once'),
+    [budget.expenses]
+  );
+
+  const debtPortfolio = useMemo(
+    () => summarizePortfolio(debtExpenses.map(e => summarizeDebt(e, getBalanceSchedule(e)))),
+    [debtExpenses]
+  );
+
+  // Where's the next payment on this debt that a one-off could ride along with?
+  const nextPaymentDate = (expense: Expense, fromDateStr: string): string | null =>
+    nextOccurrenceOnOrAfter(expense, fromDateStr);
+
+  // Can the cash flow actually stand this? A payoff plan the bank account can't
+  // fund isn't a plan. Walks the budget for a year and reports the tightest point,
+  // measured against the same floor the dashboard warns on.
+  const AFFORDABILITY_MONTHS = 12;
+
+  interface CashFlowFit {
+    lowest: number;
+    year: number;
+    month: number;
+    breachesFloor: boolean;
+    goesNegative: boolean;
+  }
+
+  const cashFlowFit = (expenses: Expense[]): CashFlowFit | null => {
+    const now = new Date();
+    const end = new Date(now.getFullYear(), now.getMonth() + AFFORDABILITY_MONTHS, 1);
+    const timeline = projectTimeline(budget.incomes, expenses, end.getFullYear(), end.getMonth())
+      // Months already gone can't be made affordable, and their lowest points
+      // would drown out anything the extra payment actually causes.
+      .filter(m => m.year > now.getFullYear() || (m.year === now.getFullYear() && m.month >= now.getMonth()));
+    if (timeline.length === 0) return null;
+
+    const tightest = timeline.reduce((worst, m) => m.lowest < worst.lowest ? m : worst, timeline[0]);
+    return {
+      lowest: tightest.lowest,
+      year: tightest.year,
+      month: tightest.month,
+      breachesFloor: tightest.lowest < data.floorThreshold,
+      goesNegative: tightest.lowest < 0
+    };
+  };
+
+  // The heart of the "where should this money go?" question: apply the same extra
+  // payment to each debt in turn and re-amortize the whole portfolio each time.
+  // Cloned expenses get fresh schedules — the cache is keyed on the object — so
+  // none of this touches what's on screen.
+  const compareExtraPaymentTargets = (amount: number, fromDateStr: string, mode: ExtraPaymentMode) => {
+    if (!(amount > 0) || debtExpenses.length === 0) return [];
+
+    const fits = new Map<string, CashFlowFit | null>();
+    const candidates = debtExpenses.flatMap(target => {
+      const targetDate = mode === 'once' ? nextPaymentDate(target, fromDateStr) : fromDateStr;
+      if (!targetDate) return []; // nothing scheduled to attach a one-off to
+      const altered = withExtraPayment(target, targetDate, amount, mode);
+      if (!altered) return [];
+
+      const result = summarizePortfolio(
+        debtExpenses.map(e => {
+          const used = e.id === target.id ? altered : e;
+          return summarizeDebt(used, getBalanceSchedule(used));
+        })
+      );
+      // Timing is the only thing that differs between targets here — the money
+      // leaves the account either way — but a debt due next week strains a
+      // different month than one due in three weeks.
+      fits.set(target.id, cashFlowFit(budget.expenses.map(e => e.id === target.id ? altered : e)));
+      return [{ debtId: target.id, debtName: target.name, result }];
     });
-    return latestDate ? Math.max(0, schedule.balanceAfter.get(latestDate)!) : schedule.startBalance;
+
+    // Sorted by interest saved, best first.
+    const rows = compareTargets(debtPortfolio, candidates)
+      .map(row => ({ ...row, fit: fits.get(row.debtId) ?? null }));
+
+    // A plan that overdraws the account isn't the best plan, whatever it saves —
+    // hand the crown to the best option that doesn't.
+    const affordable = rows.filter(r => !r.fit?.goesNegative);
+    if (affordable.length > 0 && affordable.length < rows.length) {
+      return rows.map(r => ({ ...r, isBest: r.debtId === affordable[0].debtId }));
+    }
+    return rows;
+  };
+
+  // The most that can go out without any month breaching the floor. Independent of
+  // which debt receives it, so it's one number — computed against whichever debt
+  // is due soonest, the tightest case for timing.
+  const maxAffordableExtra = (fromDateStr: string, mode: ExtraPaymentMode): number => {
+    const baseline = cashFlowFit(budget.expenses);
+    if (!baseline) return 0;
+    const headroom = baseline.lowest - data.floorThreshold;
+    if (headroom <= 0) return 0;
+
+    // Soonest payment = the tightest month gets hit first.
+    const soonest = debtExpenses
+      .map(e => ({ expense: e, date: mode === 'once' ? nextPaymentDate(e, fromDateStr) : fromDateStr }))
+      .filter((c): c is { expense: Expense; date: string } => !!c.date)
+      .sort((a, b) => a.date.localeCompare(b.date))[0];
+    if (!soonest) return 0;
+
+    const fitsAt = (extra: number) => {
+      const altered = withExtraPayment(soonest.expense, soonest.date, extra, mode);
+      if (!altered) return false;
+      const fit = cashFlowFit(budget.expenses.map(e => e.id === soonest.expense.id ? altered : e));
+      return !!fit && !fit.breachesFloor;
+    };
+
+    // A one-off can't cost more than the headroom; an ongoing raise compounds
+    // across months, so the ceiling is far lower and worth searching for.
+    let lo = 0;
+    let hi = headroom;
+    for (let i = 0; i < 14; i++) {
+      const mid = (lo + hi) / 2;
+      if (fitsAt(mid)) lo = mid; else hi = mid;
+    }
+    return Math.floor(lo);
+  };
+
+  // Commit the extra payment to the budget on screen. A one-off becomes an
+  // override on that single instance; an ongoing raise supersedes the expense from
+  // its next payment, exactly as editing the amount by hand would, so history is
+  // left alone either way.
+  const applyExtraPayment = (debtId: string) => {
+    const amount = parseFloat(extraPayment.amount);
+    const target = budget.expenses.find(e => e.id === debtId);
+    if (!target || !(amount > 0)) return;
+
+    if (extraPayment.mode === 'once') {
+      const date = nextPaymentDate(target, extraPayment.date);
+      if (!date) return;
+      const altered = withExtraPayment(target, date, amount, 'once');
+      if (altered) updateBudget({ expenses: budget.expenses.map(e => e.id === debtId ? altered : e) });
+    } else {
+      const effectiveFrom = nextOccurrenceOnOrAfter(target, extraPayment.date) || extraPayment.date;
+      const draft = { ...target, amount: target.amount + amount };
+      const next = supersedeInList(budget.expenses, debtId, draft, effectiveFrom);
+      if (next) updateBudget({ expenses: next });
+    }
+
+    setExtraPayment({ ...extraPayment, amount: '' });
+    setModal(null);
   };
 
   const handleEditEvent = (event: DayEvent) => {
@@ -2079,7 +2253,32 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     setOldMonthWarning({ show: false, event: null, item: null });
   };
 
-  const handleSignOut = async () => { 
+  // Ranked answer to "where should this money go?". Each candidate costs a
+  // portfolio re-amortization plus a cash-flow walk, so it's memoized rather than
+  // recomputed on every keystroke elsewhere in the app.
+  const extraPaymentAmount = parseFloat(extraPayment.amount);
+  const targetComparison = useMemo(
+    () => (modal === 'debt-plan' && extraPaymentAmount > 0
+      ? compareExtraPaymentTargets(extraPaymentAmount, extraPayment.date, extraPayment.mode)
+      : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [modal, extraPaymentAmount, extraPayment.date, extraPayment.mode, budget.incomes, budget.expenses, data.floorThreshold]
+  );
+
+  // The ceiling doesn't depend on what's been typed, so it survives keystrokes.
+  const affordableCeiling = useMemo(
+    () => (modal === 'debt-plan' ? maxAffordableExtra(extraPayment.date, extraPayment.mode) : 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [modal, extraPayment.date, extraPayment.mode, budget.incomes, budget.expenses, data.floorThreshold]
+  );
+
+  const formatMonthYear = (dateStr: string) =>
+    new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+
+  const formatYearMonth = (year: number, month: number) =>
+    new Date(year, month).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+
+  const handleSignOut = async () => {
     if (isPreviewMode && onExitPreview) {
       onExitPreview();
     } else {
@@ -2096,8 +2295,6 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
       }
     }
   };
-
-  if (loading) return <div className="min-h-screen bg-gray-950 flex items-center justify-center"><div className="text-gray-400">Loading...</div></div>;
 
   // The live pair behind the "earlier amount" dialog, plus what each option costs.
   const versionDetail = (() => {
@@ -2200,6 +2397,11 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                 <button onClick={() => setRenamingScenario(true)} className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-xs">Rename</button>
                 <button onClick={() => setModal('scenario-discard')} className="px-2.5 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 rounded-lg text-xs">Discard</button>
               </>
+            )}
+            {debtExpenses.length > 0 && (
+              <button onClick={() => setModal('debt-plan')} className="px-2.5 py-1.5 bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border border-purple-500/30 rounded-lg text-xs font-medium whitespace-nowrap">
+                Debt payoff
+              </button>
             )}
             {(data.scenarios || []).length > 0 && (
               <button onClick={() => setModal('scenario-compare')} className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-medium">Compare</button>
@@ -3377,6 +3579,216 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
           </div>
           <div className="flex justify-between items-center gap-3 p-4 border-t border-gray-800">
             <div className="text-xs text-gray-500">&quot;Make real&quot; applies one change to Reality and leaves the sandbox as-is.</div>
+            <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* All debts at once, and where a spare payment does the most good. */}
+      {modal === 'debt-plan' && (
+        <Modal title="Debt payoff" onClose={() => setModal(null)}>
+          <div className="p-4 space-y-4">
+            {/* Where you stand right now */}
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="p-2 bg-gray-800 rounded-lg">
+                <div className="text-xs text-gray-500 uppercase">Total debt</div>
+                <div className="font-mono text-lg font-semibold text-purple-300">{formatCurrency(debtPortfolio.totalBalance)}</div>
+              </div>
+              <div className="p-2 bg-gray-800 rounded-lg">
+                <div className="text-xs text-gray-500 uppercase">Debt-free</div>
+                <div className="font-mono text-lg font-semibold text-green-400">
+                  {debtPortfolio.debtFreeDate ? formatMonthYear(debtPortfolio.debtFreeDate) : '—'}
+                </div>
+              </div>
+              <div className="p-2 bg-gray-800 rounded-lg">
+                <div className="text-xs text-gray-500 uppercase">Interest left</div>
+                <div className="font-mono text-lg font-semibold text-yellow-400">{formatCurrency(debtPortfolio.totalInterest)}</div>
+              </div>
+            </div>
+
+            {debtPortfolio.anyNeverPaysOff && (
+              <div className="text-xs text-yellow-400/80">
+                One debt never clears at its current payment, so there&apos;s no debt-free date yet.
+              </div>
+            )}
+
+            {/* Each debt, worst rate first — that's the one interest is compounding on fastest */}
+            <div className="space-y-1">
+              {[...debtPortfolio.debts].sort((a, b) => b.apr - a.apr).map(debt => (
+                <div key={debt.id} className="flex items-center justify-between gap-2 text-xs p-2 bg-gray-800/50 rounded">
+                  <div className="min-w-0">
+                    <div className="text-gray-200 truncate">{debt.name}</div>
+                    <div className="text-gray-500">
+                      {debt.apr}% APR • {formatCurrency(debt.payment)} per payment
+                    </div>
+                  </div>
+                  <div className="text-right whitespace-nowrap">
+                    <div className="font-mono text-purple-300">{formatCurrency(debt.balance)}</div>
+                    <div className="text-gray-500">
+                      {debt.neverPaysOff || !debt.payoffDate ? 'no payoff date' : formatMonthYear(debt.payoffDate)}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* The spare money */}
+            <div className="p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg space-y-3">
+              <div className="text-xs text-purple-400 uppercase font-semibold">Put extra money to work</div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Extra amount</label>
+                  <input
+                    type="number"
+                    value={extraPayment.amount}
+                    onChange={e => setExtraPayment({ ...extraPayment, amount: e.target.value })}
+                    className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white font-mono"
+                    placeholder="500.00"
+                    step="0.01"
+                    min="0"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Starting</label>
+                  <input
+                    type="date"
+                    value={extraPayment.date}
+                    onChange={e => setExtraPayment({ ...extraPayment, date: e.target.value })}
+                    className="w-full p-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
+                  />
+                </div>
+              </div>
+              {/* What the cash flow can actually stand */}
+              <div className="text-xs">
+                {affordableCeiling > 0 ? (
+                  <span className="text-gray-400">
+                    Your projection can spare about{' '}
+                    <button
+                      type="button"
+                      onClick={() => setExtraPayment({ ...extraPayment, amount: String(affordableCeiling) })}
+                      className="font-mono text-green-400 hover:text-green-300 underline"
+                    >
+                      {formatCurrency(affordableCeiling)}
+                    </button>
+                    {extraPayment.mode === 'ongoing' ? ' per payment' : ''} before a month drops below your{' '}
+                    {formatCurrency(data.floorThreshold)} floor.
+                  </span>
+                ) : (
+                  <span className="text-yellow-400/80">
+                    Your projection has no room above the {formatCurrency(data.floorThreshold)} floor in the next
+                    year — anything extra here will make some month tighter.
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setExtraPayment({ ...extraPayment, mode: 'once' })}
+                  className={`p-2 rounded-lg border text-left ${extraPayment.mode === 'once' ? 'bg-purple-500/20 border-purple-500/50' : 'bg-gray-800 border-gray-700'}`}
+                >
+                  <div className="text-sm font-medium">Just once</div>
+                  <div className="text-xs text-gray-400">Added to the next payment.</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExtraPayment({ ...extraPayment, mode: 'ongoing' })}
+                  className={`p-2 rounded-lg border text-left ${extraPayment.mode === 'ongoing' ? 'bg-purple-500/20 border-purple-500/50' : 'bg-gray-800 border-gray-700'}`}
+                >
+                  <div className="text-sm font-medium">Every payment</div>
+                  <div className="text-xs text-gray-400">Raises the payment from now on.</div>
+                </button>
+              </div>
+            </div>
+
+            {/* What that money does, depending on where it lands */}
+            {targetComparison.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs text-gray-500 uppercase">
+                  Effect on all debts — {formatCurrency(extraPaymentAmount)}{extraPayment.mode === 'ongoing' ? ' per payment' : ' once'}
+                </div>
+                {targetComparison.map(row => (
+                  <div
+                    key={row.debtId}
+                    className={`p-3 rounded-lg border ${row.isBest ? 'bg-green-500/10 border-green-500/40' : 'bg-gray-800 border-gray-700'}`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="font-medium truncate flex items-center gap-2">
+                          {row.debtName}
+                          {row.isBest && <span className="text-xs bg-green-500/20 text-green-300 px-2 py-0.5 rounded">BEST</span>}
+                        </div>
+                        <div className="text-xs text-gray-400 mt-0.5">
+                          Saves <span className="font-mono text-green-400">{formatCurrency(row.interestSaved)}</span> interest
+                          {row.monthsSaved > 0 && <> • debt-free {row.monthsSaved} mo sooner</>}
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          All debts: {formatCurrency(row.totalInterest)} interest, clear by{' '}
+                          {row.debtFreeDate ? formatMonthYear(row.debtFreeDate) : '—'}
+                        </div>
+                        {/* Whether the bank account survives it */}
+                        {row.fit && (
+                          <div className={`text-xs mt-0.5 ${row.fit.goesNegative ? 'text-red-400' : row.fit.breachesFloor ? 'text-yellow-400' : 'text-gray-500'}`}>
+                            {row.fit.goesNegative
+                              ? `Overdraws — balance hits ${formatCurrency(row.fit.lowest)} in ${formatYearMonth(row.fit.year, row.fit.month)}`
+                              : row.fit.breachesFloor
+                                ? `Tight — dips to ${formatCurrency(row.fit.lowest)} in ${formatYearMonth(row.fit.year, row.fit.month)}, under your floor`
+                                : `Affordable — lowest ${formatCurrency(row.fit.lowest)} in ${formatYearMonth(row.fit.year, row.fit.month)}`}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => applyExtraPayment(row.debtId)}
+                        className={`px-3 py-1.5 rounded text-xs font-medium whitespace-nowrap ${row.fit?.goesNegative ? 'bg-red-600/80 hover:bg-red-600 text-white' : 'bg-purple-600 hover:bg-purple-700 text-white'}`}
+                      >
+                        Apply
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {/* The takeaway. Never recommends a target that overdraws, even when
+                    it's the one that would save the most. */}
+                {(() => {
+                  const leader = targetComparison[0];
+                  const best = targetComparison.find(r => r.isBest) || leader;
+                  const affordable = targetComparison.filter(r => !r.fit?.goesNegative);
+                  const worstAffordable = affordable[affordable.length - 1];
+
+                  if (leader.debtId !== best.debtId) {
+                    return (
+                      <div className="text-xs text-gray-400">
+                        {leader.debtName} would save{' '}
+                        <span className="font-mono">{formatCurrency(leader.interestSaved - best.interestSaved)}</span>{' '}
+                        more, but it overdraws the account
+                        {leader.fit ? ` in ${formatYearMonth(leader.fit.year, leader.fit.month)}` : ''}.{' '}
+                        {best.debtName} is the best your cash flow can actually cover.
+                      </div>
+                    );
+                  }
+                  if (worstAffordable && worstAffordable.debtId !== best.debtId
+                      && best.interestSaved - worstAffordable.interestSaved > 0.005) {
+                    return (
+                      <div className="text-xs text-gray-500">
+                        Putting it on {best.debtName} rather than {worstAffordable.debtName} keeps a further{' '}
+                        <span className="font-mono text-green-400">
+                          {formatCurrency(best.interestSaved - worstAffordable.interestSaved)}
+                        </span>.
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
+              </div>
+            )}
+
+            <div className="text-xs text-gray-500">
+              {activeScenario
+                ? `Applying writes into the ${activeScenario.name} sandbox — Reality stays as it is until you promote it.`
+                : 'You\'re in Reality, so applying changes your real budget. Fork a sandbox first if you just want to try numbers.'}
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-3 p-4 border-t border-gray-800">
             <button onClick={() => setModal(null)} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Done</button>
           </div>
         </Modal>
