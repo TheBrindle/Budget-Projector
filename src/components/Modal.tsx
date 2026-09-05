@@ -10,8 +10,10 @@ interface ModalProps {
 
 export default function Modal({ title, children, onClose }: ModalProps) {
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4" onClick={onClose}>
-      <div className="bg-gray-900 border-t sm:border border-gray-800 rounded-t-2xl sm:rounded-xl w-full sm:max-w-md max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+    // Clicking the backdrop does nothing on purpose: a stray click outside a
+    // half-filled form used to throw the whole thing away. Close with × or Cancel.
+    <div className="fixed inset-0 bg-black/70 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
+      <div className="bg-gray-900 border-t sm:border border-gray-800 rounded-t-2xl sm:rounded-xl w-full sm:max-w-md max-h-[90vh] overflow-y-auto">
         <div className="flex justify-between items-center p-4 border-b border-gray-800 sticky top-0 bg-gray-900 rounded-t-2xl sm:rounded-t-xl">
           <div className="absolute top-2 left-1/2 -translate-x-1/2 w-10 h-1 bg-gray-700 rounded-full sm:hidden" />
           <h3 className="font-semibold mt-2 sm:mt-0">{title}</h3>
