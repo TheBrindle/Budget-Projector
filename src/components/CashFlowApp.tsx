@@ -3,9 +3,10 @@
 import { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@/lib/supabase';
 import { User } from '@supabase/supabase-js';
-import { CashFlowData, CreditCard, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment } from '@/lib/types';
+import { CashFlowData, CreditCard, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment, SavingsGoal } from '@/lib/types';
 import { getPeriodRate, getDailyRate, daysBetween, resolveInterestMethod } from '@/lib/payoff';
 import { summarizeDebt, summarizePortfolio, withExtraPayment, compareTargets, ExtraPaymentMode } from '@/lib/debt';
+import { projectGoal, buildGoalExpense } from '@/lib/goals';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
 import OneTimeIncomeForm from './forms/OneTimeIncomeForm';
@@ -17,6 +18,7 @@ import CreditCardForm from './forms/CreditCardForm';
 import PaymentPlanForm from './forms/PaymentPlanForm';
 import InstanceEditForm from './forms/InstanceEditForm';
 import BalanceUpdateForm from './forms/BalanceUpdateForm';
+import SavingsGoalForm from './forms/SavingsGoalForm';
 
 const defaultData: CashFlowData = { 
   startingBalance: 0, 
@@ -189,7 +191,20 @@ const getPreviewData = (): CashFlowData => {
         category: 'utilities'
       }
     ],
-    categoryColors: {}
+    categoryColors: {},
+    goals: [
+      {
+        id: 'preview-goal-1',
+        name: 'Used pickup truck',
+        targetAmount: 12000,
+        savedSoFar: 3200,
+        savedAsOfDate: firstOfMonth,
+        monthlyAmount: 400,
+        startDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-05`,
+        planBy: 'amount',
+        note: 'Something with a bed for hauling mulch'
+      }
+    ]
   };
 };
 
@@ -197,7 +212,7 @@ const expenseCategories = [
   { value: 'housing', label: 'Housing' }, { value: 'utilities', label: 'Utilities' }, { value: 'auto', label: 'Auto/Transport' },
   { value: 'insurance', label: 'Insurance' }, { value: 'food', label: 'Food/Groceries' }, { value: 'health', label: 'Health/Medical' },
   { value: 'entertainment', label: 'Entertainment' }, { value: 'subscriptions', label: 'Subscriptions' },
-  { value: 'credit_card', label: 'Credit Cards' }, { value: 'loan', label: 'Loans' }, { value: 'other', label: 'Other' }
+  { value: 'credit_card', label: 'Credit Cards' }, { value: 'loan', label: 'Loans' }, { value: 'savings', label: 'Savings' }, { value: 'other', label: 'Other' }
 ];
 
 // Helper to get color classes for a category
@@ -946,6 +961,9 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   const [oldMonthWarning, setOldMonthWarning] = useState<{ show: boolean; event: DayEvent | null; item: Income | Expense | null }>({ show: false, event: null, item: null });
   const [editingGigPayment, setEditingGigPayment] = useState<ScheduledPayment | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: 'income' | 'expense'; item: Income | Expense } | null>(null);
+  // Savings goals ("plan to buy") — the one being edited, and the one about to go
+  const [editingGoal, setEditingGoal] = useState<SavingsGoal | null>(null);
+  const [deletingGoal, setDeletingGoal] = useState<SavingsGoal | null>(null);
   const [checkpointColumnMissing, setCheckpointColumnMissing] = useState(false);
   const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null);
   const [scenarioName, setScenarioName] = useState('');
@@ -1010,7 +1028,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
             expenses: expenses,
             categoryColors: cashflowData.category_colors || {},
             checkpoints: Array.isArray(cashflowData.checkpoints) ? cashflowData.checkpoints : [],
-            scenarios: Array.isArray(cashflowData.scenarios) ? cashflowData.scenarios : []
+            scenarios: Array.isArray(cashflowData.scenarios) ? cashflowData.scenarios : [],
+            goals: Array.isArray(cashflowData.goals) ? cashflowData.goals : []
           });
         }
       } catch (err) {
@@ -1041,7 +1060,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         expenses: newData.expenses,
         category_colors: newData.categoryColors || {},
         checkpoints: newData.checkpoints || [],
-        scenarios: newData.scenarios || []
+        scenarios: newData.scenarios || [],
+        goals: newData.goals || []
       };
 
       const write = (body: Record<string, unknown>) => existingData
@@ -1052,8 +1072,8 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
       // These columns are newer than some databases. Rather than lose the whole
       // save, drop whichever one is missing and tell the user to run the migration.
-      if (error && /checkpoints|scenarios/i.test(error.message || '')) {
-        const { checkpoints, scenarios, ...core } = payload;
+      if (error && /checkpoints|scenarios|goals/i.test(error.message || '')) {
+        const { checkpoints, scenarios, goals, ...core } = payload;
         ({ error } = await write(core));
         setCheckpointColumnMissing(true);
       }
@@ -2199,6 +2219,108 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     return Math.floor(lo);
   };
 
+  // ── Savings goals ("plan to buy") ──────────────────────────────────────────
+  // Goals live on Reality, like checkpoints — a purchase you're saving for is a
+  // fact about your life, not a budget alternative. The monthly contribution,
+  // though, is a budget item: a linked Savings expense in whichever budget is on
+  // screen, so a sandbox can try a goal on without Reality committing to it.
+  const goals = useMemo(() => data.goals || [], [data.goals]);
+
+  const goalOutlooks = useMemo(() => {
+    const today = todayStr();
+    return goals.map(goal => ({
+      goal,
+      outlook: projectGoal(goal, today),
+      inBudget: budget.expenses.some(e => e.goalId === goal.id)
+    }));
+  }, [goals, budget.expenses]);
+
+  // A candidate contribution as a throwaway expense, for fit checks only.
+  const goalProbeExpense = (monthly: number, startDate: string, goalId?: string): Expense => ({
+    id: `goal-probe-${goalId || 'new'}`,
+    name: 'Savings probe',
+    amount: monthly,
+    frequency: 'monthly',
+    startDate,
+    category: 'savings'
+  });
+
+  // Can the cash flow stand this much a month? Same walk the debt planner uses.
+  // The goal's own linked expense is left out so editing a goal doesn't count
+  // its contribution twice.
+  const goalFit = (monthly: number, startDate: string, goalId?: string): CashFlowFit | null =>
+    cashFlowFit([...budget.expenses.filter(e => !goalId || e.goalId !== goalId), goalProbeExpense(monthly, startDate, goalId)]);
+
+  // The most per month that fits above the floor — a binary search on a probe
+  // that starts today, the way maxAffordableExtra's ongoing mode works.
+  const maxAffordableMonthlySaving = (goalId?: string): number => {
+    const others = budget.expenses.filter(e => !goalId || e.goalId !== goalId);
+    const baseline = cashFlowFit(others);
+    if (!baseline) return 0;
+    const headroom = baseline.lowest - data.floorThreshold;
+    if (headroom <= 0) return 0;
+
+    const today = todayStr();
+    let lo = 0;
+    let hi = headroom;
+    for (let i = 0; i < 14; i++) {
+      const mid = (lo + hi) / 2;
+      const fit = cashFlowFit([...others, goalProbeExpense(mid, today, goalId)]);
+      if (fit && !fit.breachesFloor) lo = mid; else hi = mid;
+    }
+    return Math.floor(lo);
+  };
+
+  // Write a goal's contribution into a budget: update the linked expense in place
+  // if there is one, otherwise add one. In place rather than a new version — the
+  // goal is the source of truth for this expense, and its "as of" date already
+  // draws the line between contributions made and contributions still planned.
+  const syncGoalExpense = (goal: SavingsGoal, expenses: Expense[]): Expense[] => {
+    const draft = buildGoalExpense(goal, projectGoal(goal, todayStr()));
+    if (!draft) return expenses.filter(e => e.goalId !== goal.id); // funded — nothing left to contribute
+    const existing = expenses.find(e => e.goalId === goal.id);
+    if (existing) return expenses.map(e => e.id === existing.id ? { ...existing, ...draft } : e);
+    return [...expenses, { ...draft, id: Date.now().toString() }];
+  };
+
+  const saveGoal = (draft: Omit<SavingsGoal, 'id'>, addToBudget: boolean) => {
+    const goal: SavingsGoal = { ...draft, id: editingGoal?.id || Date.now().toString() };
+    const nextGoals = editingGoal ? goals.map(g => g.id === goal.id ? goal : g) : [...goals, goal];
+    const nextExpenses = addToBudget
+      ? syncGoalExpense(goal, budget.expenses)
+      : budget.expenses.filter(e => e.goalId !== goal.id);
+    // One write: the goal lands on Reality, the expense in the budget on screen.
+    if (activeScenarioId) {
+      updateData({
+        goals: nextGoals,
+        scenarios: (data.scenarios || []).map(s => s.id === activeScenarioId ? { ...s, expenses: nextExpenses } : s)
+      });
+    } else {
+      updateData({ goals: nextGoals, expenses: nextExpenses });
+    }
+    setEditingGoal(null);
+    setModal(null);
+  };
+
+  // Drop a goal and every contribution expense that funded it, in Reality and in
+  // every sandbox — an orphaned "Saving: X" line would keep draining a budget for
+  // something you're no longer buying.
+  const deleteGoal = (goal: SavingsGoal) => {
+    updateData({
+      goals: goals.filter(g => g.id !== goal.id),
+      expenses: data.expenses.filter(e => e.goalId !== goal.id),
+      scenarios: (data.scenarios || []).map(s => ({ ...s, expenses: s.expenses.filter(e => e.goalId !== goal.id) }))
+    });
+    setDeletingGoal(null);
+    setModal(null);
+  };
+
+  const toggleGoalInBudget = (goal: SavingsGoal, inBudget: boolean) => {
+    updateBudget({
+      expenses: inBudget ? syncGoalExpense(goal, budget.expenses) : budget.expenses.filter(e => e.goalId !== goal.id)
+    });
+  };
+
   // Commit the extra payment to the budget on screen. A one-off becomes an
   // override on that single instance; an ongoing raise supersedes the expense from
   // its next payment, exactly as editing the amount by hand would, so history is
@@ -2275,8 +2397,19 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     [modal, extraPayment.date, extraPayment.mode, budget.incomes, budget.expenses, data.floorThreshold]
   );
 
+  // Room for a monthly saving, worked out once when the goal form opens so it
+  // survives keystrokes in the form.
+  const goalCeiling = useMemo(
+    () => (modal === 'goal' ? maxAffordableMonthlySaving(editingGoal?.id) : 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [modal, editingGoal?.id, budget.incomes, budget.expenses, data.floorThreshold]
+  );
+
   const formatMonthYear = (dateStr: string) =>
     new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+
+  const formatFullDate = (dateStr: string) =>
+    new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
   const formatYearMonth = (year: number, month: number) =>
     new Date(year, month).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
@@ -2340,7 +2473,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
             {saving && <span className="text-xs text-gray-500">Saving...</span>}
           </div>
           <nav className="hidden sm:flex gap-1 bg-gray-800 p-1 rounded-lg">
-            {['dashboard', 'income', 'expenses', 'settings'].map(tab => (
+            {['dashboard', 'income', 'expenses', 'goals', 'settings'].map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} className={`px-3 py-1.5 text-sm font-medium rounded-md capitalize ${activeTab === tab ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'}`}>{tab}</button>
             ))}
           </nav>
@@ -2350,7 +2483,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         </div>
         {mobileMenuOpen && (
           <nav className="sm:hidden mt-3 flex flex-col gap-1 bg-gray-800 p-2 rounded-lg">
-            {['dashboard', 'income', 'expenses', 'settings'].map(tab => (<button key={tab} onClick={() => { setActiveTab(tab); setMobileMenuOpen(false); }} className={`px-4 py-3 text-left text-sm font-medium rounded-md capitalize ${activeTab === tab ? 'bg-gray-700 text-white' : 'text-gray-400'}`}>{tab}</button>))}
+            {['dashboard', 'income', 'expenses', 'goals', 'settings'].map(tab => (<button key={tab} onClick={() => { setActiveTab(tab); setMobileMenuOpen(false); }} className={`px-4 py-3 text-left text-sm font-medium rounded-md capitalize ${activeTab === tab ? 'bg-gray-700 text-white' : 'text-gray-400'}`}>{tab}</button>))}
             <button onClick={handleSignOut} className="px-4 py-3 text-left text-sm font-medium rounded-md text-red-400 hover:bg-gray-700">{isPreviewMode ? 'Exit Preview' : 'Sign Out'}</button>
           </nav>
         )}
@@ -2424,7 +2557,29 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
         {activeTab === 'dashboard' && (
           <div className="space-y-3">
             {alerts.map((alert, i) => (<div key={i} className={`p-3 rounded-lg flex items-start gap-2 ${alert.type === 'danger' ? 'bg-red-500/10 border border-red-500/30 text-red-400' : 'bg-yellow-500/10 border border-yellow-500/30 text-yellow-400'}`}><span className="text-lg">{alert.type === 'danger' ? '🚨' : '⚠️'}</span><div><div className="font-semibold text-sm">{alert.title}</div><div className="text-xs opacity-90">{alert.text}</div></div></div>))}
-            
+
+            {/* What you're saving toward, and when the money's there */}
+            {goalOutlooks.length > 0 && (
+              <div className="p-3 rounded-lg bg-lime-500/5 border border-lime-500/20 flex flex-col sm:flex-row sm:items-center gap-2">
+                <span className="text-lg">🎯</span>
+                <div className="flex-1 min-w-0 text-xs space-y-0.5">
+                  {goalOutlooks.slice(0, 3).map(({ goal, outlook }) => (
+                    <div key={goal.id} className="flex justify-between gap-2">
+                      <span className="text-gray-300 truncate">{goal.name}</span>
+                      <span className="whitespace-nowrap text-gray-400">
+                        <span className="font-mono text-lime-300">{formatCurrency(outlook.savedToday)}</span> / {formatCurrency(goal.targetAmount)}
+                        {outlook.isFunded
+                          ? <span className="text-green-400"> • funded</span>
+                          : outlook.readyDate ? ` • ${formatMonthYear(outlook.readyDate)}` : ''}
+                      </span>
+                    </div>
+                  ))}
+                  {goalOutlooks.length > 3 && <div className="text-gray-500">+{goalOutlooks.length - 3} more</div>}
+                </div>
+                <button onClick={() => setActiveTab('goals')} className="px-3 py-1.5 bg-lime-600/80 hover:bg-lime-600 text-white text-sm font-medium rounded-lg whitespace-nowrap">Goals</button>
+              </div>
+            )}
+
             {/* Reality check — is the projection still tracking the real account? */}
             {(!driftInsight || driftInsight.daysSince >= 14) && (
               <div className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/30 flex flex-col sm:flex-row sm:items-center gap-2">
@@ -2999,6 +3154,16 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                                 <div className="font-medium truncate flex items-center gap-2">
                                   <span className={`${catColor.text}`}>●</span>
                                   {expense.name}
+                                  {expense.goalId && (
+                                    <button
+                                      type="button"
+                                      onClick={e => { e.stopPropagation(); setActiveTab('goals'); }}
+                                      className="text-xs bg-lime-500/20 text-lime-300 hover:bg-lime-500/30 px-2 py-0.5 rounded"
+                                      title="Funds a savings goal — edit the goal to change this"
+                                    >
+                                      🎯 goal
+                                    </button>
+                                  )}
                                   {isPaidOff && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">PAID OFF</span>}
                                   {expense.endDate && !isPaidOff && (
                                     <span className="text-xs bg-gray-700 text-gray-400 px-2 py-0.5 rounded">
@@ -3105,6 +3270,112 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
           </div>
         )}
 
+        {activeTab === 'goals' && (
+          <div className="space-y-3">
+            <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 p-3 bg-gray-800 border-b border-gray-700">
+                <div>
+                  <h2 className="font-semibold">Plan to buy</h2>
+                  <p className="text-xs text-gray-500 mt-0.5">Big-ticket items you&apos;re saving for. Set a monthly amount to learn the date, or a date to learn the amount.</p>
+                </div>
+                <button onClick={() => { setEditingGoal(null); setModal('goal'); }} className="px-3 py-2 bg-lime-600 hover:bg-lime-700 text-white text-sm font-medium rounded-lg whitespace-nowrap">+ Goal</button>
+              </div>
+              <div className="p-3 space-y-2">
+                {goalOutlooks.length === 0 ? (
+                  <div className="text-center py-8 text-gray-500">
+                    <div className="text-3xl mb-2">🎯</div>
+                    <div className="font-medium">Nothing planned yet</div>
+                    <div className="text-xs mt-1">A car, a mower, a roof — add the price and how much you can put aside each month.</div>
+                  </div>
+                ) : goalOutlooks.map(({ goal, outlook, inBudget }) => (
+                  <div key={goal.id} className={`p-3 rounded-lg border ${outlook.isFunded ? 'bg-green-500/5 border-green-500/20' : 'bg-gray-800 border-gray-700'}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium flex items-center gap-2 flex-wrap">
+                          <span className="text-lime-400">●</span>
+                          <span className="truncate">{goal.name}</span>
+                          {outlook.isFunded && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">FUNDED</span>}
+                          {inBudget && !outlook.isFunded && <span className="text-xs bg-lime-500/20 text-lime-300 px-2 py-0.5 rounded">in budget</span>}
+                          {outlook.onTrack === false && !outlook.isFunded && <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded">behind</span>}
+                        </div>
+                        {goal.note && <div className="text-xs text-gray-500 ml-4 truncate">{goal.note}</div>}
+                      </div>
+                      <div className="flex gap-1">
+                        <button onClick={() => { setEditingGoal(goal); setModal('goal'); }} className="px-2.5 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-xs">Edit</button>
+                        <button onClick={() => { setDeletingGoal(goal); setModal('goal-delete'); }} className="w-7 h-7 bg-gray-700 hover:bg-red-500/30 text-gray-400 hover:text-red-300 rounded text-sm">×</button>
+                      </div>
+                    </div>
+
+                    {/* How far along */}
+                    <div className="mt-3">
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="font-mono text-lime-300">{formatCurrency(outlook.savedToday)}</span>
+                        <span className="text-gray-500">of <span className="font-mono text-gray-300">{formatCurrency(goal.targetAmount)}</span></span>
+                      </div>
+                      <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                        <div className={`h-full rounded-full ${outlook.isFunded ? 'bg-green-500' : 'bg-lime-500'}`} style={{ width: `${Math.round(outlook.progress * 100)}%` }} />
+                      </div>
+                    </div>
+
+                    <div className="mt-2 grid grid-cols-3 gap-2 text-center">
+                      <div className="p-2 bg-gray-900/60 rounded">
+                        <div className="text-[10px] text-gray-500 uppercase">Per month</div>
+                        <div className="font-mono text-sm">{formatCurrency(goal.monthlyAmount)}</div>
+                      </div>
+                      <div className="p-2 bg-gray-900/60 rounded">
+                        <div className="text-[10px] text-gray-500 uppercase">Still to go</div>
+                        <div className="font-mono text-sm">{formatCurrency(outlook.remaining)}</div>
+                      </div>
+                      <div className="p-2 bg-gray-900/60 rounded">
+                        <div className="text-[10px] text-gray-500 uppercase">{goal.planBy === 'date' ? 'Buy by' : 'Ready'}</div>
+                        <div className={`text-sm ${outlook.isFunded ? 'text-green-400' : outlook.onTrack === false ? 'text-yellow-400' : 'text-lime-300'}`}>
+                          {outlook.isFunded ? 'Now'
+                            : goal.planBy === 'date' && goal.targetDate ? formatMonthYear(goal.targetDate)
+                            : outlook.readyDate ? formatMonthYear(outlook.readyDate) : '—'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-2 text-xs text-gray-400">
+                      {outlook.isFunded ? (
+                        'The money is there. Bought it? Remove the goal.'
+                      ) : outlook.contributionsLeft < 0 ? (
+                        'No monthly amount set yet — edit the goal to pick one.'
+                      ) : (
+                        <>
+                          {outlook.contributionsLeft} more contribution{outlook.contributionsLeft === 1 ? '' : 's'}
+                          {outlook.readyDate && ` — money's there ${formatFullDate(outlook.readyDate)}`}
+                          {outlook.onTrack === false && goal.targetDate && (
+                            outlook.requiredMonthly === null
+                              ? <span className="text-yellow-400"> • no contribution dates left before {formatMonthYear(goal.targetDate)}</span>
+                              : <span className="text-yellow-400"> • needs {formatCurrency(outlook.requiredMonthly)}/mo to make {formatMonthYear(goal.targetDate)}</span>
+                          )}
+                        </>
+                      )}
+                    </div>
+
+                    {!outlook.isFunded && outlook.contributionsLeft > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <button
+                          onClick={() => toggleGoalInBudget(goal, !inBudget)}
+                          className={`px-2.5 py-1 rounded text-xs font-medium border ${inBudget ? 'bg-gray-700/50 border-gray-600 text-gray-300 hover:bg-gray-700' : 'bg-lime-500/20 border-lime-500/30 text-lime-200 hover:bg-lime-500/30'}`}
+                        >
+                          {inBudget ? `Remove from ${activeScenario ? activeScenario.name : 'budget'}` : `Add to ${activeScenario ? activeScenario.name : 'budget'}`}
+                        </button>
+                        <span className="text-[11px] text-gray-500">
+                          {inBudget
+                            ? 'A monthly Savings expense carries the contribution through the projection.'
+                            : 'Not in this budget — the projection doesn’t see the money leaving yet.'}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'settings' && (
           <div className="space-y-3">
             <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
@@ -3133,11 +3404,12 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
 
               {checkpointColumnMissing && (
                 <div className="m-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs text-yellow-300 space-y-1">
-                  <div className="font-semibold">Checkpoints and scenarios aren&apos;t saving to your database yet.</div>
+                  <div className="font-semibold">Checkpoints, scenarios and savings goals aren&apos;t saving to your database yet.</div>
                   <div className="text-yellow-300/80">Run this once in the Supabase SQL editor:</div>
                   <code className="block p-2 bg-gray-950 rounded font-mono text-[11px] text-yellow-200 overflow-x-auto whitespace-pre">
 {`ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS checkpoints JSONB DEFAULT '[]'::jsonb;
-ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb;`}
+ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS goals JSONB DEFAULT '[]'::jsonb;`}
                   </code>
                 </div>
               )}
@@ -3981,6 +4253,38 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]':
       )}
 
       {/* Discard a sandbox */}
+      {/* Plan to buy — add or edit a savings goal */}
+      {modal === 'goal' && (
+        <Modal title={editingGoal ? `Edit "${editingGoal.name}"` : 'Plan to buy'} onClose={() => { setModal(null); setEditingGoal(null); }}>
+          <SavingsGoalForm
+            goal={editingGoal}
+            inBudget={!!editingGoal && budget.expenses.some(e => e.goalId === editingGoal.id)}
+            floorThreshold={data.floorThreshold}
+            ceiling={goalCeiling}
+            checkFit={(monthly, startDate) => goalFit(monthly, startDate, editingGoal?.id)}
+            onSave={saveGoal}
+            onClose={() => { setModal(null); setEditingGoal(null); }}
+          />
+        </Modal>
+      )}
+
+      {modal === 'goal-delete' && deletingGoal && (
+        <Modal title={`Remove "${deletingGoal.name}"?`} onClose={() => { setModal(null); setDeletingGoal(null); }}>
+          <div className="p-4 space-y-3">
+            <p className="text-sm text-gray-300">
+              {data.expenses.some(e => e.goalId === deletingGoal.id) || (data.scenarios || []).some(s => s.expenses.some(e => e.goalId === deletingGoal.id))
+                ? 'Its monthly Savings expense comes out of every budget too — Reality and any sandbox — so nothing keeps draining for something you’re no longer buying.'
+                : 'No budget carries a contribution for it, so nothing else changes.'}
+            </p>
+            <p className="text-xs text-gray-500">What you&apos;ve already set aside stays in your account; the app just stops tracking it.</p>
+            <div className="flex justify-end gap-3 pt-1">
+              <button onClick={() => { setModal(null); setDeletingGoal(null); }} className="px-4 py-2 bg-gray-800 text-white rounded-lg">Keep it</button>
+              <button onClick={() => deleteGoal(deletingGoal)} className="px-4 py-2 bg-red-600 text-white rounded-lg font-medium">Remove goal</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
       {modal === 'scenario-discard' && activeScenario && (
         <Modal title={`Discard "${activeScenario.name}"?`} onClose={() => setModal(null)}>
           <div className="p-4 space-y-2">

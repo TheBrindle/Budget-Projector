@@ -13,6 +13,7 @@ const categories = [
   { value: 'entertainment', label: 'Entertainment' },
   { value: 'subscriptions', label: 'Subscriptions' },
   { value: 'loan', label: 'Loans' },
+  { value: 'savings', label: 'Savings' },
   { value: 'other', label: 'Other' }
 ];
 

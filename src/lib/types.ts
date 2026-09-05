@@ -92,6 +92,26 @@ export interface Expense {
   paymentPlan?: PaymentPlan;
   splitConfig?: SplitConfig; // Required when frequency is 'split'
   overrides?: InstanceOverride[];
+  goalId?: string; // Set when this expense is the monthly contribution that funds a SavingsGoal
+}
+
+// A big purchase you're saving toward — a car, a mower, a roof. The plan is
+// "put this much aside each month, starting here", and the app works out when
+// the money is there (or, planning from a buy date, how much each month it
+// takes). Contributions leave the cash flow as a linked monthly Savings expense,
+// so the purchase itself comes out of what's been set aside, not the checking
+// projection.
+export interface SavingsGoal {
+  id: string;
+  name: string;
+  targetAmount: number; // what the item costs
+  savedSoFar: number; // already set aside, as of savedAsOfDate
+  savedAsOfDate: string; // YYYY-MM-DD — contributions after this are projected, earlier ones are in savedSoFar
+  monthlyAmount: number; // planned contribution per month
+  startDate: string; // YYYY-MM-DD — first contribution; its day-of-month sets every later one
+  targetDate?: string; // YYYY-MM-DD — the date you want to buy by, when planning by date
+  planBy: 'amount' | 'date'; // which of the two the user chose; the other is derived
+  note?: string;
 }
 
 // A real bank balance recorded on a real date. Projections re-anchor to the most
@@ -128,6 +148,7 @@ export interface CashFlowData {
   categoryColors?: Record<string, string>; // category value -> color key
   checkpoints?: BalanceCheckpoint[];
   scenarios?: Scenario[];
+  goals?: SavingsGoal[]; // Purchases being saved for — Reality-level facts, like checkpoints
 }
 
 // Available colors for categories
@@ -152,6 +173,7 @@ export type CategoryColorKey = typeof categoryColorOptions[number]['key'];
 export const defaultCategoryColors: Record<string, CategoryColorKey> = {
   credit_card: 'purple',
   loan: 'teal',
+  savings: 'lime',
 };
 
 export interface DayEvent {

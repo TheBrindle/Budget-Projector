@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS cashflow_data (
   category_colors JSONB DEFAULT '{}'::jsonb,
   checkpoints JSONB DEFAULT '[]'::jsonb,
   scenarios JSONB DEFAULT '[]'::jsonb,
+  goals JSONB DEFAULT '[]'::jsonb,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   UNIQUE(user_id)
@@ -48,3 +49,6 @@ ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS checkpoints JSONB DEFAULT '[]
 
 -- Migration to add scenarios (sandbox forks of the budget):
 ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS scenarios JSONB DEFAULT '[]'::jsonb;
+
+-- Migration to add savings goals (plan-to-buy items):
+ALTER TABLE cashflow_data ADD COLUMN IF NOT EXISTS goals JSONB DEFAULT '[]'::jsonb;
