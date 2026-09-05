@@ -28,9 +28,12 @@ const addMonthsClamped = (start: Date, n: number): Date => {
 // Nothing is saved for longer than this. Keeps every loop below finite.
 const MAX_CONTRIBUTIONS = 600; // 50 years
 
+const isSkipped = (goal: SavingsGoal, dateStr: string) => !!goal.skippedDates?.includes(dateStr);
+
 // How many contributions fall strictly after `afterStr` and on or before
 // `throughStr`. The half-open window is what makes "as of" dates work: the
-// contribution dated on the as-of day is already inside savedSoFar.
+// contribution dated on the as-of day is already inside savedSoFar. Skipped
+// months don't count — that's the whole point of skipping one.
 export const countContributions = (goal: SavingsGoal, afterStr: string, throughStr: string): number => {
   if (throughStr <= afterStr) return 0;
   const start = parse(goal.startDate);
@@ -38,21 +41,38 @@ export const countContributions = (goal: SavingsGoal, afterStr: string, throughS
   for (let n = 0; n < MAX_CONTRIBUTIONS; n++) {
     const d = format(addMonthsClamped(start, n));
     if (d > throughStr) break;
-    if (d > afterStr) count++;
+    if (d > afterStr && !isSkipped(goal, d)) count++;
   }
   return count;
 };
 
-// The k-th contribution date strictly after `afterStr` (k = 1 is the next one).
+// The k-th contribution date strictly after `afterStr` (k = 1 is the next one),
+// skipped months excluded.
 export const nthContributionAfter = (goal: SavingsGoal, afterStr: string, k: number): string | null => {
   if (k < 1) return null;
   const start = parse(goal.startDate);
   let seen = 0;
   for (let n = 0; n < MAX_CONTRIBUTIONS; n++) {
     const d = format(addMonthsClamped(start, n));
-    if (d > afterStr && ++seen === k) return d;
+    if (d > afterStr && !isSkipped(goal, d) && ++seen === k) return d;
   }
   return null;
+};
+
+// The next `limit` scheduled months after `afterStr`, skipped ones included and
+// flagged — this is the list you pick from when deciding which month to sit out.
+export const upcomingContributions = (
+  goal: SavingsGoal,
+  afterStr: string,
+  limit: number
+): { date: string; skipped: boolean }[] => {
+  const start = parse(goal.startDate);
+  const out: { date: string; skipped: boolean }[] = [];
+  for (let n = 0; n < MAX_CONTRIBUTIONS && out.length < limit; n++) {
+    const d = format(addMonthsClamped(start, n));
+    if (d > afterStr) out.push({ date: d, skipped: isSkipped(goal, d) });
+  }
+  return out;
 };
 
 export interface GoalOutlook {
@@ -137,7 +157,12 @@ export const buildGoalExpense = (goal: SavingsGoal, outlook: GoalOutlook): Omit<
   const firstUncounted = nthContributionAfter(goal, goal.savedAsOfDate, 1);
   const startDate = firstUncounted && firstUncounted >= goal.startDate ? firstUncounted : goal.startDate;
 
-  const overrides: InstanceOverride[] = [];
+  // Skipped months become skipped instances, so the calendar shows the gap and
+  // the cash flow keeps the money that month.
+  const overrides: InstanceOverride[] = (goal.skippedDates || [])
+    .filter(d => d >= startDate && d <= outlook.readyDate!)
+    .sort()
+    .map(d => ({ originalDate: d, newDate: 'SKIPPED', note: `Skipped contribution toward ${goal.name}` }));
   if (outlook.lastContribution < goal.monthlyAmount - 0.005) {
     overrides.push({
       originalDate: outlook.readyDate,
@@ -155,6 +180,67 @@ export const buildGoalExpense = (goal: SavingsGoal, outlook: GoalOutlook): Omit<
     endDate: outlook.readyDate,
     category: 'savings',
     goalId: goal.id,
+    goalRole: 'contribution',
     overrides: overrides.length ? overrides : undefined,
+  };
+};
+
+// The loan behind a financed purchase: what's borrowed once the down payment
+// (the goal) is met, and the level monthly payment that clears it over the term.
+export interface FinancingTerms {
+  financed: number;
+  payment: number;
+  apr: number;
+  termMonths: number;
+}
+
+export const financingTerms = (goal: SavingsGoal): FinancingTerms | null => {
+  const f = goal.financing;
+  if (!f || !(f.termMonths > 0)) return null;
+  const financed = Math.max(0, (f.totalPrice || 0) - goal.targetAmount);
+  if (financed <= 0) return null;
+  const r = (f.apr || 0) / 100 / 12;
+  const raw = r > 0
+    ? financed * r / (1 - Math.pow(1 + r, -f.termMonths))
+    : financed / f.termMonths;
+  return { financed, payment: Math.ceil(raw * 100) / 100, apr: f.apr || 0, termMonths: f.termMonths };
+};
+
+// When the purchase happens: the day the last contribution lands, or — if the
+// down payment is already there — the date the goal was last saved from.
+export const purchaseDateFor = (goal: SavingsGoal, outlook: GoalOutlook, todayStr: string): string =>
+  outlook.readyDate ?? (goal.savedAsOfDate > todayStr ? goal.savedAsOfDate : todayStr);
+
+// The loan payment as a balance-tracked loan expense, first payment one month
+// after the purchase. Carries a balance block so the debt planner amortizes it
+// like any other loan. `keepStart` holds an existing expense's start date once
+// the goal is funded, so the schedule doesn't drift day by day.
+export const buildGoalPaymentExpense = (
+  goal: SavingsGoal,
+  outlook: GoalOutlook,
+  todayStr: string,
+  keepStart?: string
+): Omit<Expense, 'id'> | null => {
+  const terms = financingTerms(goal);
+  if (!terms) return null;
+  const purchase = purchaseDateFor(goal, outlook, todayStr);
+  const startDate = outlook.isFunded && keepStart ? keepStart : format(addMonthsClamped(parse(purchase), 1));
+  const asOf = format(addMonthsClamped(parse(startDate), -1));
+  return {
+    name: `${goal.name} payment`,
+    amount: terms.payment,
+    frequency: 'monthly',
+    startDate,
+    category: 'loan',
+    goalId: goal.id,
+    goalRole: 'payment',
+    creditCard: {
+      totalDebt: terms.financed,
+      currentBalance: terms.financed,
+      balanceAsOfDate: asOf,
+      apr: terms.apr,
+      minimumPayment: terms.payment,
+      interestMethod: 'periodic',
+    },
   };
 };

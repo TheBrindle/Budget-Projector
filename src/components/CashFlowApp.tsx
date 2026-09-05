@@ -6,7 +6,7 @@ import { User } from '@supabase/supabase-js';
 import { CashFlowData, CreditCard, Income, Expense, DayData, DayEvent, InstanceOverride, isSkippedOverride, categoryColorOptions, defaultCategoryColors, CategoryColorKey, ScheduledPayment, SavingsGoal } from '@/lib/types';
 import { getPeriodRate, getDailyRate, daysBetween, resolveInterestMethod } from '@/lib/payoff';
 import { summarizeDebt, summarizePortfolio, withExtraPayment, compareTargets, ExtraPaymentMode } from '@/lib/debt';
-import { projectGoal, buildGoalExpense } from '@/lib/goals';
+import { projectGoal, buildGoalExpense, buildGoalPaymentExpense, financingTerms, purchaseDateFor, upcomingContributions } from '@/lib/goals';
 import Modal from './Modal';
 import IncomeForm from './forms/IncomeForm';
 import OneTimeIncomeForm from './forms/OneTimeIncomeForm';
@@ -964,6 +964,7 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   // Savings goals ("plan to buy") — the one being edited, and the one about to go
   const [editingGoal, setEditingGoal] = useState<SavingsGoal | null>(null);
   const [deletingGoal, setDeletingGoal] = useState<SavingsGoal | null>(null);
+  const [impactGoalId, setImpactGoalId] = useState<string | null>(null); // which goal's budget-impact chart is open
   const [checkpointColumnMissing, setCheckpointColumnMissing] = useState(false);
   const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null);
   const [scenarioName, setScenarioName] = useState('');
@@ -1536,7 +1537,32 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     const existingOverrides = currentItem.overrides || [];
     const newOverrides = existingOverrides.filter(o => o.originalDate !== override.originalDate);
     newOverrides.push(override);
-    
+
+    // A savings contribution skipped from the calendar is a skipped month on the
+    // goal — the goal owns it, so the ready date moves and every budget agrees.
+    const goal = editingEvent.type === 'expense' ? goals.find(g => g.id === (currentItem as Expense).goalId) : undefined;
+    if (goal) {
+      const wasSkipped = !!goal.skippedDates?.includes(override.originalDate);
+      if (isSkippedOverride(override)) {
+        updateData(withGoalSkip(goal, override.originalDate, true));
+        setModal(null); setEditingItem(null); setEditingEvent(null);
+        return;
+      }
+      if (wasSkipped) {
+        // Rejoining the month with a different amount or date: un-skip on the
+        // goal, then lay this edit over the rebuilt expense on screen.
+        const patch = withGoalSkip(goal, override.originalDate, false);
+        const layer = (list: Expense[]) => list.map(e => e.goalId === goal.id
+          ? pruneOrphanedOverrides({ ...e, overrides: [...(e.overrides || []).filter(o => o.originalDate !== override.originalDate), override] })
+          : e);
+        updateData(activeScenarioId
+          ? { ...patch, scenarios: patch.scenarios!.map(s => s.id === activeScenarioId ? { ...s, expenses: layer(s.expenses) } : s) }
+          : { ...patch, expenses: layer(patch.expenses!) });
+        setModal(null); setEditingItem(null); setEditingEvent(null);
+        return;
+      }
+    }
+
     if (editingEvent.type === 'income') {
       updateIncome(editingItem.id, { overrides: newOverrides });
     } else {
@@ -1557,7 +1583,15 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
     
     const originalDate = editingEvent.originalDate || editingEvent.instanceDate;
     const newOverrides = (currentItem.overrides || []).filter(o => o.originalDate !== originalDate);
-    
+
+    // Restoring a skipped savings contribution = un-skipping the month on the goal.
+    const goal = editingEvent.type === 'expense' ? goals.find(g => g.id === (currentItem as Expense).goalId) : undefined;
+    if (goal && goal.skippedDates?.includes(originalDate)) {
+      updateData(withGoalSkip(goal, originalDate, false));
+      setModal(null); setEditingItem(null); setEditingEvent(null);
+      return;
+    }
+
     if (editingEvent.type === 'income') {
       updateIncome(editingItem.id, { overrides: newOverrides });
     } else {
@@ -2275,32 +2309,97 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
   // if there is one, otherwise add one. In place rather than a new version — the
   // goal is the source of truth for this expense, and its "as of" date already
   // draws the line between contributions made and contributions still planned.
+  //
+  // A financed goal carries two: the contribution while saving, and the loan
+  // payment after buying. Once the purchase has happened the loan is left alone —
+  // balance updates recorded against it are real, and a resync must not undo them.
   const syncGoalExpense = (goal: SavingsGoal, expenses: Expense[]): Expense[] => {
-    const draft = buildGoalExpense(goal, projectGoal(goal, todayStr()));
-    if (!draft) return expenses.filter(e => e.goalId !== goal.id); // funded — nothing left to contribute
-    const existing = expenses.find(e => e.goalId === goal.id);
-    if (existing) return expenses.map(e => e.id === existing.id ? { ...existing, ...draft } : e);
-    return [...expenses, { ...draft, id: Date.now().toString() }];
+    const today = todayStr();
+    const outlook = projectGoal(goal, today);
+    const hasRole = (e: Expense, role: 'contribution' | 'payment') => e.goalId === goal.id && (e.goalRole || 'contribution') === role;
+    const existingPayment = expenses.find(e => hasRole(e, 'payment'));
+    const plan: { role: 'contribution' | 'payment'; draft: Omit<Expense, 'id'> | null }[] = [
+      { role: 'contribution', draft: buildGoalExpense(goal, outlook) },
+      { role: 'payment', draft: buildGoalPaymentExpense(goal, outlook, today, existingPayment?.startDate) }
+    ];
+    let next = expenses;
+    plan.forEach(({ role, draft }, i) => {
+      const existing = next.find(e => hasRole(e, role));
+      if (!draft) next = next.filter(e => !hasRole(e, role)); // nothing left to contribute / not financed
+      else if (existing && role === 'payment' && outlook.isFunded) return; // the loan is live now
+      else if (existing) next = next.map(e => e.id === existing.id ? { ...existing, ...draft } : e);
+      else next = [...next, { ...draft, id: `${Date.now()}-${i}` }];
+    });
+    return next;
+  };
+
+  // Bring every budget that already carries this goal's expense up to date with
+  // the goal — Reality and each sandbox. Budgets without the link are left alone.
+  const resyncGoalEverywhere = (goal: SavingsGoal): Pick<CashFlowData, 'expenses' | 'scenarios'> => {
+    const linked = (list: Expense[]) => list.some(e => e.goalId === goal.id);
+    return {
+      expenses: linked(data.expenses) ? syncGoalExpense(goal, data.expenses) : data.expenses,
+      scenarios: (data.scenarios || []).map(s => linked(s.expenses) ? { ...s, expenses: syncGoalExpense(goal, s.expenses) } : s)
+    };
   };
 
   const saveGoal = (draft: Omit<SavingsGoal, 'id'>, addToBudget: boolean) => {
-    const goal: SavingsGoal = { ...draft, id: editingGoal?.id || Date.now().toString() };
+    const goal: SavingsGoal = { ...draft, id: editingGoal?.id || Date.now().toString(), skippedDates: editingGoal?.skippedDates };
     const nextGoals = editingGoal ? goals.map(g => g.id === goal.id ? goal : g) : [...goals, goal];
+    // Other budgets that already carry the expense follow the edit; the budget on
+    // screen gets it added or removed as the checkbox says.
+    const synced = resyncGoalEverywhere(goal);
+    const onScreen = activeScenarioId
+      ? synced.scenarios!.find(s => s.id === activeScenarioId)!.expenses
+      : synced.expenses;
     const nextExpenses = addToBudget
-      ? syncGoalExpense(goal, budget.expenses)
-      : budget.expenses.filter(e => e.goalId !== goal.id);
-    // One write: the goal lands on Reality, the expense in the budget on screen.
+      ? syncGoalExpense(goal, onScreen)
+      : onScreen.filter(e => e.goalId !== goal.id);
     if (activeScenarioId) {
       updateData({
         goals: nextGoals,
-        scenarios: (data.scenarios || []).map(s => s.id === activeScenarioId ? { ...s, expenses: nextExpenses } : s)
+        expenses: synced.expenses,
+        scenarios: synced.scenarios!.map(s => s.id === activeScenarioId ? { ...s, expenses: nextExpenses } : s)
       });
     } else {
-      updateData({ goals: nextGoals, expenses: nextExpenses });
+      updateData({ goals: nextGoals, expenses: nextExpenses, scenarios: synced.scenarios });
     }
     setEditingGoal(null);
     setModal(null);
   };
+
+  // Sit out (or rejoin) one month's contribution. The goal owns the skip; every
+  // linked expense is rebuilt from it so the calendar shows the gap and the ready
+  // date slides a month. Returns the patch so callers can fold in their own edit.
+  const withGoalSkip = (goal: SavingsGoal, date: string, skipped: boolean): Partial<CashFlowData> => {
+    const current = goal.skippedDates || [];
+    const skippedDates = skipped
+      ? (current.includes(date) ? current : [...current, date].sort())
+      : current.filter(d => d !== date);
+    const next: SavingsGoal = { ...goal, skippedDates: skippedDates.length ? skippedDates : undefined };
+    return { goals: goals.map(g => g.id === goal.id ? next : g), ...resyncGoalEverywhere(next) };
+  };
+
+  const toggleGoalSkip = (goal: SavingsGoal, date: string) =>
+    updateData(withGoalSkip(goal, date, !goal.skippedDates?.includes(date)));
+
+  // What the contribution does to the next year, month by month: the lowest
+  // point each month with the goal's expense in the budget and without it.
+  const goalImpact = useMemo(() => {
+    const goal = impactGoalId ? goals.find(g => g.id === impactGoalId) : null;
+    if (!goal) return null;
+    const now = new Date();
+    const end = new Date(now.getFullYear(), now.getMonth() + AFFORDABILITY_MONTHS - 1, 1);
+    const fromNow = (m: MonthProjection) => m.year > now.getFullYear() || (m.year === now.getFullYear() && m.month >= now.getMonth());
+    const without = budget.expenses.filter(e => e.goalId !== goal.id);
+    const withGoal = syncGoalExpense(goal, without);
+    const a = projectTimeline(budget.incomes, without, end.getFullYear(), end.getMonth()).filter(fromNow);
+    const b = projectTimeline(budget.incomes, withGoal, end.getFullYear(), end.getMonth()).filter(fromNow);
+    const months = a.map((m, i) => ({ year: m.year, month: m.month, without: m.lowest, withGoal: b[i]?.lowest ?? m.lowest }));
+    const tightest = months.reduce((worst, m) => m.withGoal < worst.withGoal ? m : worst, months[0]);
+    return { goal, months, tightest, inBudget: budget.expenses.some(e => e.goalId === goal.id) };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [impactGoalId, goals, budget.incomes, budget.expenses, data.floorThreshold]);
 
   // Drop a goal and every contribution expense that funded it, in Reality and in
   // every sandbox — an orphaned "Saving: X" line would keep draining a budget for
@@ -3336,6 +3435,24 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                       </div>
                     </div>
 
+                    {/* A financed purchase: the down payment is the goal, the loan follows it */}
+                    {(() => {
+                      const terms = financingTerms(goal);
+                      if (!terms) return null;
+                      const purchase = purchaseDateFor(goal, outlook, todayStr());
+                      const firstPayment = new Date(purchase + 'T12:00:00');
+                      firstPayment.setMonth(firstPayment.getMonth() + 1);
+                      return (
+                        <div className="mt-2 p-2 bg-teal-500/5 border border-teal-500/20 rounded text-xs text-gray-400">
+                          <span className="text-teal-300 font-medium">After purchase:</span>{' '}
+                          <span className="font-mono text-teal-200">{formatCurrency(terms.payment)}</span>/mo for {terms.termMonths} months
+                          {' '}on {formatCurrency(terms.financed)} financed at {terms.apr}% APR
+                          {' — '}first payment {formatMonthYear(formatDateStr(firstPayment))}.
+                          {inBudget && ' Scheduled as a loan expense.'}
+                        </div>
+                      );
+                    })()}
+
                     <div className="mt-2 text-xs text-gray-400">
                       {outlook.isFunded ? (
                         'The money is there. Bought it? Remove the goal.'
@@ -3367,6 +3484,106 @@ export default function CashFlowApp({ user, onExitPreview }: CashFlowAppProps) {
                             ? 'A monthly Savings expense carries the contribution through the projection.'
                             : 'Not in this budget — the projection doesn’t see the money leaving yet.'}
                         </span>
+                      </div>
+                    )}
+
+                    {/* Which months to sit out — each skip slides the ready date back one */}
+                    {!outlook.isFunded && goal.monthlyAmount > 0 && (
+                      <div className="mt-3">
+                        <div className="text-[10px] text-gray-500 uppercase mb-1">
+                          Next contributions <span className="normal-case">— tap a month to skip it</span>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {upcomingContributions(goal, todayStr(), 8).map(({ date, skipped }) => (
+                            <button
+                              key={date}
+                              type="button"
+                              onClick={() => toggleGoalSkip(goal, date)}
+                              title={skipped ? 'Skipped — tap to put it back' : 'Tap to skip this month'}
+                              className={`px-2 py-1 rounded text-xs border ${skipped
+                                ? 'bg-gray-900 border-gray-700 text-gray-500 line-through'
+                                : 'bg-lime-500/10 border-lime-500/30 text-lime-200 hover:bg-lime-500/20'}`}
+                            >
+                              {formatMonthYear(date)}
+                            </button>
+                          ))}
+                        </div>
+                        {(goal.skippedDates || []).length > 0 && (
+                          <div className="text-[11px] text-gray-500 mt-1">
+                            {(goal.skippedDates || []).length} month{(goal.skippedDates || []).length === 1 ? '' : 's'} skipped
+                            {outlook.readyDate && ` — ready date is now ${formatMonthYear(outlook.readyDate)}`}.
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* What the contribution does to the budget, month by month */}
+                    {!outlook.isFunded && goal.monthlyAmount > 0 && (
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => setImpactGoalId(impactGoalId === goal.id ? null : goal.id)}
+                          className="text-xs text-blue-400 hover:text-blue-300 underline"
+                        >
+                          {impactGoalId === goal.id ? 'Hide budget impact' : 'Show budget impact'}
+                        </button>
+                        {impactGoalId === goal.id && goalImpact && goalImpact.goal.id === goal.id && goalImpact.months.length > 0 && (() => {
+                          const { months, tightest } = goalImpact;
+                          const floor = data.floorThreshold;
+                          const values = months.flatMap(m => [m.without, m.withGoal]);
+                          const top = Math.max(0, floor, ...values) * 1.08 || 1;
+                          const bottom = Math.min(0, ...values) * 1.08;
+                          const W = 640, H = 180, L = 46, R = 8, T = 10, B = 24;
+                          const plotW = W - L - R, plotH = H - T - B;
+                          const y = (v: number) => T + (top - v) / (top - bottom) * plotH;
+                          const group = plotW / months.length;
+                          const bar = group * 0.34;
+                          const shade = (v: number) => v < 0 ? '#f87171' : v < floor ? '#fbbf24' : '#84cc16';
+                          const label = (v: number) => (Math.abs(v) >= 1000 ? `${(v / 1000).toFixed(1)}k` : Math.round(v).toString());
+                          return (
+                            <div className="mt-2 p-2 bg-gray-900/60 rounded-lg">
+                              <div className="text-[11px] text-gray-400 mb-1">
+                                Lowest balance each month, <span className="text-gray-300">without</span> the {formatCurrency(goal.monthlyAmount)} contribution and{' '}
+                                <span className="text-lime-300">with</span> it. Dashed line is your {formatCurrency(floor)} floor.
+                              </div>
+                              <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Budget impact chart">
+                                {/* axis ticks */}
+                                {[top / 1.08, floor, 0, bottom / 1.08].filter((v, i, arr) => arr.indexOf(v) === i && v >= bottom && v <= top).map(v => (
+                                  <g key={v}>
+                                    <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} stroke={v === floor ? '#fbbf24' : '#374151'} strokeWidth={v === floor ? 1.5 : 1} strokeDasharray={v === floor ? '5 4' : v === 0 ? undefined : '2 4'} />
+                                    <text x={L - 4} y={y(v) + 3} textAnchor="end" fontSize="10" fill={v === floor ? '#fbbf24' : '#6b7280'} fontFamily="monospace">{label(v)}</text>
+                                  </g>
+                                ))}
+                                {months.map((m, i) => {
+                                  const x0 = L + i * group + (group - bar * 2 - 3) / 2;
+                                  const rect = (v: number, x: number, fill: string, opacity: number, name: string) => (
+                                    <rect x={x} y={Math.min(y(v), y(0))} width={bar} height={Math.max(1, Math.abs(y(v) - y(0)))} fill={fill} opacity={opacity} rx={2}>
+                                      <title>{`${formatYearMonth(m.year, m.month)} — ${name}: ${formatCurrency(v)}`}</title>
+                                    </rect>
+                                  );
+                                  return (
+                                    <g key={`${m.year}-${m.month}`}>
+                                      {rect(m.without, x0, '#9ca3af', 0.55, 'without')}
+                                      {rect(m.withGoal, x0 + bar + 3, shade(m.withGoal), 0.95, 'with contribution')}
+                                      <text x={L + i * group + group / 2} y={H - 8} textAnchor="middle" fontSize="10" fill="#6b7280">
+                                        {new Date(m.year, m.month).toLocaleDateString('en-US', { month: 'short' })}
+                                      </text>
+                                    </g>
+                                  );
+                                })}
+                              </svg>
+                              <div className="text-[11px] mt-1">
+                                {tightest.withGoal < 0 ? (
+                                  <span className="text-red-400">Tightest month is {formatYearMonth(tightest.year, tightest.month)}: {formatCurrency(tightest.withGoal)} with the contribution, {formatCurrency(tightest.without)} without. That overdraws — skip that month or lower the amount.</span>
+                                ) : tightest.withGoal < floor ? (
+                                  <span className="text-yellow-400">Tightest month is {formatYearMonth(tightest.year, tightest.month)}: {formatCurrency(tightest.withGoal)} with the contribution, {formatCurrency(tightest.without)} without — under your floor.</span>
+                                ) : (
+                                  <span className="text-green-400/80">Fits all year. Tightest month is {formatYearMonth(tightest.year, tightest.month)} at {formatCurrency(tightest.withGoal)}, {formatCurrency(tightest.without)} without.</span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
                   </div>

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { SavingsGoal } from '@/lib/types';
-import { projectGoal, requiredMonthlyFor } from '@/lib/goals';
+import { projectGoal, requiredMonthlyFor, financingTerms } from '@/lib/goals';
 
 // What the cash-flow walk says about a candidate monthly amount. Mirrors the
 // app's CashFlowFit so the form can show "fits" / "too tight" without knowing
@@ -58,6 +58,11 @@ export default function SavingsGoalForm({ goal, inBudget, floorThreshold, ceilin
     targetDate: goal?.targetDate || defaultTargetDate(),
     startDate: goal?.startDate || today,
     note: goal?.note || '',
+    // Financing the rest — a car: the goal is the down payment, a loan covers the balance
+    financed: !!goal?.financing,
+    totalPrice: goal?.financing?.totalPrice?.toString() || '',
+    apr: goal?.financing?.apr?.toString() || '',
+    termMonths: goal?.financing?.termMonths?.toString() || '60',
   });
   const [addToBudget, setAddToBudget] = useState(goal ? inBudget : true);
 
@@ -80,6 +85,10 @@ export default function SavingsGoalForm({ goal, inBudget, floorThreshold, ceilin
       startDate: form.startDate,
       targetDate: form.planBy === 'date' ? form.targetDate : undefined,
       planBy: form.planBy,
+      skippedDates: goal?.skippedDates,
+      financing: form.financed && parseFloat(form.totalPrice) > 0
+        ? { totalPrice: parseFloat(form.totalPrice), apr: parseFloat(form.apr) || 0, termMonths: parseInt(form.termMonths) || 0 }
+        : undefined,
       note: form.note || undefined,
     };
     if (form.planBy === 'date') {
@@ -121,13 +130,58 @@ export default function SavingsGoalForm({ goal, inBudget, floorThreshold, ceilin
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="text-xs text-gray-500 uppercase block mb-1">Price</label>
+            <label className="text-xs text-gray-500 uppercase block mb-1">{form.financed ? 'Down payment' : 'Price'}</label>
             <input type="number" value={form.targetAmount} onChange={e => setForm({ ...form, targetAmount: e.target.value })} className={`${inputClass} font-mono`} placeholder="0.00" step="0.01" min="0" />
           </div>
           <div>
             <label className="text-xs text-gray-500 uppercase block mb-1">Already saved</label>
             <input type="number" value={form.savedSoFar} onChange={e => setForm({ ...form, savedSoFar: e.target.value })} className={`${inputClass} font-mono`} placeholder="0.00" step="0.01" min="0" />
           </div>
+        </div>
+
+        {/* Financing — the goal is the down payment, a loan covers the rest */}
+        <div className={`rounded-lg border ${form.financed ? 'bg-teal-500/5 border-teal-500/20' : 'border-gray-800'}`}>
+          <label className="flex items-start gap-2 text-sm cursor-pointer p-3">
+            <input type="checkbox" checked={form.financed} onChange={e => setForm({ ...form, financed: e.target.checked })} className="mt-0.5" />
+            <span>
+              <span className="text-gray-200">Saving a down payment — the rest is financed</span>
+              <span className="block text-xs text-gray-500">A car, say. The app works out the monthly payment and schedules it after the purchase.</span>
+            </span>
+          </label>
+          {form.financed && (
+            <div className="px-3 pb-3 space-y-3">
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="text-xs text-gray-500 uppercase block mb-1">Total price</label>
+                  <input type="number" value={form.totalPrice} onChange={e => setForm({ ...form, totalPrice: e.target.value })} className={`${inputClass} font-mono`} placeholder="0.00" step="0.01" min="0" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 uppercase block mb-1">APR %</label>
+                  <input type="number" value={form.apr} onChange={e => setForm({ ...form, apr: e.target.value })} className={`${inputClass} font-mono`} placeholder="6.9" step="0.01" min="0" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 uppercase block mb-1">Months</label>
+                  <input type="number" value={form.termMonths} onChange={e => setForm({ ...form, termMonths: e.target.value })} className={`${inputClass} font-mono`} placeholder="60" step="1" min="1" />
+                </div>
+              </div>
+              {(() => {
+                const terms = financingTerms(draft);
+                if (!terms) {
+                  return parseFloat(form.totalPrice) > 0 && parseFloat(form.totalPrice) <= targetAmount
+                    ? <div className="text-xs text-yellow-400">The down payment covers the whole price — nothing left to finance.</div>
+                    : <div className="text-xs text-gray-500">Enter the total price and term to see the payment.</div>;
+                }
+                return (
+                  <div className="text-xs text-gray-400">
+                    Financing <span className="font-mono text-teal-200">{formatCurrency(terms.financed)}</span> at {terms.apr}% over {terms.termMonths} months →{' '}
+                    <span className="font-mono text-teal-200 font-semibold">{formatCurrency(terms.payment)}</span>/mo, starting the month after
+                    {outlook?.readyDate && !outlook.isFunded ? ` ${formatMonthYear(outlook.readyDate)}` : ' you buy'}.
+                    Total interest about {formatCurrency(terms.payment * terms.termMonths - terms.financed)}.
+                  </div>
+                );
+              })()}
+            </div>
+          )}
         </div>
 
         {savedSoFar > 0 && (
@@ -265,7 +319,8 @@ export default function SavingsGoalForm({ goal, inBudget, floorThreshold, ceilin
           <span>
             <span className="text-gray-200">Put the monthly contribution in my budget</span>
             <span className="block text-xs text-gray-500">
-              Adds a monthly Savings expense{outlook?.readyDate && !outlook.isFunded ? ` through ${formatMonthYear(outlook.readyDate)}` : ''} so the projection shows the money leaving. The purchase itself comes out of what you&apos;ve set aside.
+              Adds a monthly Savings expense{outlook?.readyDate && !outlook.isFunded ? ` through ${formatMonthYear(outlook.readyDate)}` : ''} so the projection shows the money leaving.
+              {form.financed ? ' The loan payment is scheduled after the purchase as a balance-tracked loan.' : ' The purchase itself comes out of what you’ve set aside.'}
             </span>
           </span>
         </label>

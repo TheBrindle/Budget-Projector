@@ -92,7 +92,8 @@ export interface Expense {
   paymentPlan?: PaymentPlan;
   splitConfig?: SplitConfig; // Required when frequency is 'split'
   overrides?: InstanceOverride[];
-  goalId?: string; // Set when this expense is the monthly contribution that funds a SavingsGoal
+  goalId?: string; // Set when this expense belongs to a SavingsGoal
+  goalRole?: 'contribution' | 'payment'; // the monthly saving toward it (default) or the loan payment after buying it
 }
 
 // A big purchase you're saving toward — a car, a mower, a roof. The plan is
@@ -111,6 +112,15 @@ export interface SavingsGoal {
   startDate: string; // YYYY-MM-DD — first contribution; its day-of-month sets every later one
   targetDate?: string; // YYYY-MM-DD — the date you want to buy by, when planning by date
   planBy: 'amount' | 'date'; // which of the two the user chose; the other is derived
+  skippedDates?: string[]; // Scheduled contribution dates (YYYY-MM-DD) you're sitting out — each one pushes the ready date back a month
+  // Set when the goal is a down payment and the rest is financed — a car, say.
+  // The monthly payment is worked out from these and becomes a linked loan
+  // expense that starts the month after the purchase.
+  financing?: {
+    totalPrice: number; // sticker price; financed amount = totalPrice - targetAmount
+    apr: number; // annual rate, percent
+    termMonths: number;
+  };
   note?: string;
 }
 
